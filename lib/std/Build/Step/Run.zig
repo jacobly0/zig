@@ -1072,7 +1072,7 @@ fn spawnChildAndCollect(
     else
         evalGeneric(self, &child);
 
-    const term = try child.wait();
+    const term = try child.waitTimeout();
     const elapsed_ns = timer.read();
 
     return .{

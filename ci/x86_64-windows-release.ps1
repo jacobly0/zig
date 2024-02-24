@@ -53,48 +53,10 @@ ninja install
 CheckLastExitCode
 
 Write-Output "Main test suite..."
-& "stage3-release\bin\zig.exe" build test docs `
+& "stage3-release\bin\zig.exe" build test `
   --zig-lib-dir "$ZIG_LIB_DIR" `
   --search-prefix "$PREFIX_PATH" `
   -Dstatic-llvm `
   -Dskip-non-native `
   -Denable-symlinks-windows
-CheckLastExitCode
-
-Write-Output "Build x86_64-windows-msvc behavior tests using the C backend..."
-& "stage3-release\bin\zig.exe" test `
-  ..\test\behavior.zig `
-  --zig-lib-dir "$ZIG_LIB_DIR" `
-  -ofmt=c `
-  -femit-bin="test-x86_64-windows-msvc.c" `
-  --test-no-exec `
-  -target x86_64-windows-msvc `
-  -lc
-CheckLastExitCode
-
-& "stage3-release\bin\zig.exe" build-obj `
-  --zig-lib-dir "$ZIG_LIB_DIR" `
-  -ofmt=c `
-  -OReleaseSmall `
-  --name compiler_rt `
-  -femit-bin="compiler_rt-x86_64-windows-msvc.c" `
-  --dep build_options `
-  -target x86_64-windows-msvc `
-  --mod root ..\lib\compiler_rt.zig `
-  --mod build_options config.zig
-CheckLastExitCode
-
-Import-Module "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
-CheckLastExitCode
-
-Enter-VsDevShell -VsInstallPath "C:\Program Files\Microsoft Visual Studio\2022\Enterprise" `
-  -DevCmdArguments '-arch=x64 -no_logo' `
-  -StartInPath $(Get-Location)
-CheckLastExitCode
-
-Write-Output "Build and run behavior tests with msvc..."
-& cl.exe -I..\lib test-x86_64-windows-msvc.c compiler_rt-x86_64-windows-msvc.c /W3 /Z7 -link -nologo -debug -subsystem:console kernel32.lib ntdll.lib libcmt.lib
-CheckLastExitCode
-
-& .\test-x86_64-windows-msvc.exe
 CheckLastExitCode

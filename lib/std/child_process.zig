@@ -262,6 +262,17 @@ pub const ChildProcess = struct {
         return term;
     }
 
+    pub fn waitTimeout(self: *ChildProcess) !Term {
+        const term = if (builtin.os.tag == .windows)
+            try self.waitWindowsTimeout()
+        else
+            try self.waitPosix();
+
+        self.id = undefined;
+
+        return term;
+    }
+
     pub const RunResult = struct {
         term: Term,
         stdout: []u8,
@@ -371,6 +382,16 @@ pub const ChildProcess = struct {
         return self.term.?;
     }
 
+    fn waitWindowsTimeout(self: *ChildProcess) !Term {
+        if (self.term) |term| {
+            self.cleanupStreams();
+            return term;
+        }
+
+        try self.waitUnwrappedWindowsTimeout();
+        return self.term.?;
+    }
+
     fn waitPosix(self: *ChildProcess) !Term {
         if (self.term) |term| {
             self.cleanupStreams();
@@ -383,6 +404,37 @@ pub const ChildProcess = struct {
 
     fn waitUnwrappedWindows(self: *ChildProcess) !void {
         const result = windows.WaitForSingleObjectEx(self.id, windows.INFINITE, false);
+
+        self.term = @as(SpawnError!Term, x: {
+            var exit_code: windows.DWORD = undefined;
+            if (windows.kernel32.GetExitCodeProcess(self.id, &exit_code) == 0) {
+                break :x Term{ .Unknown = 0 };
+            } else {
+                break :x Term{ .Exited = @as(u8, @truncate(exit_code)) };
+            }
+        });
+
+        if (self.request_resource_usage_statistics) {
+            self.resource_usage_statistics.rusage = try windows.GetProcessMemoryInfo(self.id);
+        }
+
+        os.close(self.id);
+        os.close(self.thread_handle);
+        self.cleanupStreams();
+        return result;
+    }
+
+    fn waitUnwrappedWindowsTimeout(self: *ChildProcess) (windows.WaitForSingleObjectError || windows.GetProcessMemoryInfoError)!void {
+        const result = windows.WaitForSingleObjectEx(self.id, std.time.ms_per_hour / 2, false) catch |err| switch (err) {
+            error.WaitTimeOut => {
+                _ = self.kill() catch |kill_err| {
+                    std.debug.print("kill: {}\n", .{kill_err});
+                    return err;
+                };
+                return;
+            },
+            else => {},
+        };
 
         self.term = @as(SpawnError!Term, x: {
             var exit_code: windows.DWORD = undefined;

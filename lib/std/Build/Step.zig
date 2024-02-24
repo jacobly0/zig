@@ -405,7 +405,7 @@ pub fn evalZigProcess(
     child.stdin.?.close();
     child.stdin = null;
 
-    const term = child.wait() catch |err| {
+    const term = child.waitTimeout() catch |err| {
         return s.fail("unable to wait for {s}: {s}", .{ argv[0], @errorName(err) });
     };
     s.result_duration_ns = timer.read();
