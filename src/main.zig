@@ -2738,9 +2738,9 @@ fn buildOutputType(
             zig_lib_directory.path orelse ".", "std", "std.zig",
         });
         const main_path = try fs.path.resolve(arena, &.{
-            main_mod.root.root_dir.path orelse ".",
-            main_mod.root.sub_path,
-            main_mod.root_src_path,
+            main_mod.root_dir.root_dir.path orelse ".",
+            main_mod.root_dir.sub_path,
+            main_mod.root_file.sub_path,
         });
         break :m mem.eql(u8, main_path, std_path);
     };
@@ -3352,8 +3352,7 @@ fn buildOutputType(
 
     if (show_builtin) {
         const builtin_mod = comp.root_mod.getBuiltinDependency();
-        const source = builtin_mod.builtin_file.?.source;
-        return std.io.getStdOut().writeAll(source);
+        return std.io.getStdOut().writeAll(builtin_mod.root_file.source);
     }
     switch (listen) {
         .none => {},
@@ -5080,12 +5079,12 @@ fn cmdBuild(gpa: Allocator, arena: Allocator, args: []const []const u8) !void {
 
                 var fetch: Package.Fetch = .{
                     .arena = std.heap.ArenaAllocator.init(gpa),
-                    .location = .{ .relative_path = build_mod.root },
+                    .location = .{ .relative_path = build_mod.root_dir },
                     .location_tok = 0,
                     .hash_tok = 0,
                     .name_tok = 0,
                     .lazy_status = .eager,
-                    .parent_package_root = build_mod.root,
+                    .parent_package_root = build_mod.root_dir,
                     .parent_manifest_ast = null,
                     .prog_node = root_prog_node,
                     .job_queue = &job_queue,
@@ -5105,7 +5104,7 @@ fn cmdBuild(gpa: Allocator, arena: Allocator, args: []const []const u8) !void {
                 job_queue.all_fetches.appendAssumeCapacity(&fetch);
 
                 job_queue.table.putAssumeCapacityNoClobber(
-                    Package.Fetch.relativePathDigest(build_mod.root, global_cache_directory),
+                    Package.Fetch.relativePathDigest(build_mod.root_dir, global_cache_directory),
                     &fetch,
                 );
 
@@ -6082,7 +6081,7 @@ fn cmdAstCheck(
         .source_loaded = false,
         .tree_loaded = false,
         .zir_loaded = false,
-        .sub_file_path = undefined,
+        .sub_path = undefined,
         .source = undefined,
         .stat = undefined,
         .tree = undefined,
@@ -6106,7 +6105,7 @@ fn cmdAstCheck(
         if (amt != stat.size)
             return error.UnexpectedEndOfFile;
 
-        file.sub_file_path = file_name;
+        file.sub_path = file_name;
         file.source = source;
         file.source_loaded = true;
         file.stat = .{
@@ -6119,15 +6118,15 @@ fn cmdAstCheck(
         const source = std.zig.readSourceFileToEndAlloc(arena, stdin, null) catch |err| {
             fatal("unable to read stdin: {}", .{err});
         };
-        file.sub_file_path = "<stdin>";
+        file.sub_path = "<stdin>";
         file.source = source;
         file.source_loaded = true;
         file.stat.size = source.len;
     }
 
-    file.mod = try Package.Module.createLimited(arena, .{
+    try Package.Module.createLimited(arena, .{
         .root = Cache.Path.cwd(),
-        .root_src_path = file.sub_file_path,
+        .root_file = &file,
         .fully_qualified_name = "root",
     });
 
@@ -6219,7 +6218,7 @@ fn cmdDumpZir(
         .source_loaded = false,
         .tree_loaded = false,
         .zir_loaded = true,
-        .sub_file_path = undefined,
+        .sub_path = undefined,
         .source = undefined,
         .stat = undefined,
         .tree = undefined,
@@ -6285,7 +6284,7 @@ fn cmdChangelist(
         .source_loaded = false,
         .tree_loaded = false,
         .zir_loaded = false,
-        .sub_file_path = old_source_file,
+        .sub_path = old_source_file,
         .source = undefined,
         .stat = .{
             .size = stat.size,
@@ -6298,9 +6297,9 @@ fn cmdChangelist(
         .root_decl = .none,
     };
 
-    file.mod = try Package.Module.createLimited(arena, .{
+    try Package.Module.createLimited(arena, .{
         .root = Cache.Path.cwd(),
-        .root_src_path = file.sub_file_path,
+        .root_file = &file,
         .fully_qualified_name = "root",
     });
 

@@ -1163,7 +1163,7 @@ fn addModuleTableToCacheHash(
     var i: usize = 0;
     while (i < seen_table.count()) : (i += 1) {
         const mod = seen_table.keys()[i];
-        if (mod.isBuiltin()) {
+        if (mod.is_builtin) {
             // Skip builtin.zig; it is useless as an input, and we don't want to
             // have to write it before checking for a cache hit.
             continue;
@@ -1173,19 +1173,19 @@ fn addModuleTableToCacheHash(
 
         switch (hash_type) {
             .path_bytes => {
-                hash.addBytes(mod.root_src_path);
-                hash.addOptionalBytes(mod.root.root_dir.path);
-                hash.addBytes(mod.root.sub_path);
+                hash.addBytes(mod.root_file.sub_path);
+                hash.addOptionalBytes(mod.root_dir.root_dir.path);
+                hash.addBytes(mod.root_dir.sub_path);
             },
-            .files => |man| if (mod.root_src_path.len != 0) {
-                const pkg_zig_file = try mod.root.joinString(arena, mod.root_src_path);
+            .files => |man| if (mod.root_file.sub_path.len != 0) {
+                const pkg_zig_file = try mod.root_dir.joinString(arena, mod.root_file.sub_path);
                 _ = try man.addFile(pkg_zig_file, null);
             },
         }
 
         mod.deps.sortUnstable(SortByName{
             .has_builtin = mod.deps.count() >= 1 and
-                mod.deps.values()[0].isBuiltin(),
+                mod.deps.values()[0].is_builtin,
             .names = mod.deps.keys(),
         });
 
@@ -2109,7 +2109,7 @@ pub fn update(comp: *Compilation, main_progress_node: *std.Progress.Node) !void 
         // to update it.
         try comp.astgen_work_queue.ensureUnusedCapacity(module.import_table.count());
         for (module.import_table.values()) |file| {
-            if (file.mod.isBuiltin()) continue;
+            if (file.mod.is_builtin) continue;
             comp.astgen_work_queue.writeItemAssumeCapacity(file);
         }
 
@@ -3303,11 +3303,10 @@ pub fn performAllTheWork(
                 for (mod.deps.values()) |dep|
                     try seen.put(comp.gpa, dep, {});
 
-                const file = mod.builtin_file orelse continue;
-
+                if (!mod.is_builtin) continue;
                 comp.astgen_wait_group.start();
                 try comp.thread_pool.spawn(workerUpdateBuiltinZigFile, .{
-                    comp, mod, file, &comp.astgen_wait_group,
+                    comp, mod, mod.root_file, &comp.astgen_wait_group,
                 });
             }
         }
@@ -3749,11 +3748,11 @@ fn docsCopyFallible(comp: *Compilation) anyerror!void {
 }
 
 fn docsCopyModule(comp: *Compilation, module: *Package.Module, name: []const u8, tar_file: std.fs.File) !void {
-    const root = module.root;
-    const sub_path = if (root.sub_path.len == 0) "." else root.sub_path;
-    var mod_dir = root.root_dir.handle.openDir(sub_path, .{ .iterate = true }) catch |err| {
+    const root_dir = module.root_dir;
+    const sub_path = if (root_dir.sub_path.len == 0) "." else root_dir.sub_path;
+    var mod_dir = root_dir.root_dir.handle.openDir(sub_path, .{ .iterate = true }) catch |err| {
         return comp.lockAndSetMiscFailure(.docs_copy, "unable to open directory '{}': {s}", .{
-            root, @errorName(err),
+            root_dir, @errorName(err),
         });
     };
     defer mod_dir.close();
@@ -3775,14 +3774,14 @@ fn docsCopyModule(comp: *Compilation, module: *Package.Module, name: []const u8,
 
         var file = mod_dir.openFile(entry.path, .{}) catch |err| {
             return comp.lockAndSetMiscFailure(.docs_copy, "unable to open '{}{s}': {s}", .{
-                root, entry.path, @errorName(err),
+                root_dir, entry.path, @errorName(err),
             });
         };
         defer file.close();
 
         const stat = file.stat() catch |err| {
             return comp.lockAndSetMiscFailure(.docs_copy, "unable to stat '{}{s}': {s}", .{
-                root, entry.path, @errorName(err),
+                root_dir, entry.path, @errorName(err),
             });
         };
 
@@ -3967,7 +3966,7 @@ fn workerAstGenFile(
 ) void {
     defer wg.finish();
 
-    var child_prog_node = prog_node.start(file.sub_file_path, 0);
+    var child_prog_node = prog_node.start(file.sub_path, 0);
     child_prog_node.activate();
     defer child_prog_node.end();
 
@@ -4019,7 +4018,7 @@ fn workerAstGenFile(
             };
             if (import_result.is_new) {
                 log.debug("AstGen of {s} has import '{s}'; queuing AstGen of {s}", .{
-                    file.sub_file_path, import_path, import_result.file.sub_file_path,
+                    file.sub_path, import_path, import_result.file.sub_path,
                 });
                 const sub_src: AstGenSrc = .{ .import = .{
                     .importing_file = file,
@@ -4049,7 +4048,7 @@ fn workerUpdateBuiltinZigFile(
         defer comp.mutex.unlock();
 
         comp.setMiscFailure(.write_builtin_zig, "unable to write '{}{s}': {s}", .{
-            mod.root, mod.root_src_path, @errorName(err),
+            mod.root_dir, mod.root_file.sub_path, @errorName(err),
         });
     };
 }
@@ -4074,7 +4073,7 @@ fn workerCheckEmbedFile(
 fn detectEmbedFileUpdate(comp: *Compilation, embed_file: *Module.EmbedFile) !void {
     const mod = comp.module.?;
     const ip = &mod.intern_pool;
-    var file = try embed_file.owner.root.openFile(embed_file.sub_file_path.toSlice(ip), .{});
+    var file = try embed_file.owner.root_dir.openFile(embed_file.sub_path.toSlice(ip), .{});
     defer file.close();
 
     const stat = try file.stat();
@@ -4421,7 +4420,7 @@ fn reportRetryableAstGenError(
     };
 
     const err_msg = try Module.ErrorMsg.create(gpa, src_loc, "unable to load '{}{s}': {s}", .{
-        file.mod.root, file.sub_file_path, @errorName(err),
+        file.mod.root_dir, file.sub_path, @errorName(err),
     });
     errdefer err_msg.destroy(gpa);
 
@@ -4442,8 +4441,8 @@ fn reportRetryableEmbedFileError(
     const src_loc = embed_file.src_loc;
     const ip = &mod.intern_pool;
     const err_msg = try Module.ErrorMsg.create(gpa, src_loc, "unable to load '{}{s}': {s}", .{
-        embed_file.owner.root,
-        embed_file.sub_file_path.toSlice(ip),
+        embed_file.owner.root_dir,
+        embed_file.sub_path.toSlice(ip),
         @errorName(err),
     });
 

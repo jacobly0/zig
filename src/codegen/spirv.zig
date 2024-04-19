@@ -5589,7 +5589,7 @@ const DeclGen = struct {
         const dbg_stmt = self.air.instructions.items(.data)[@intFromEnum(inst)].dbg_stmt;
         const mod = self.module;
         const decl = mod.declPtr(self.decl_index);
-        const path = decl.getFileScope(mod).sub_file_path;
+        const path = decl.getFileScope(mod).sub_path;
         try self.func.body.emit(self.spv.gpa, .OpLine, .{
             .file = try self.spv.resolveString(path),
             .line = self.base_line + dbg_stmt.line + 1,

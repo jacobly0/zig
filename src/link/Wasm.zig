@@ -561,7 +561,9 @@ pub fn createEmpty(
             const index: File.Index = @enumFromInt(wasm.files.len);
             var zig_object: ZigObject = .{
                 .index = index,
-                .path = try std.fmt.allocPrint(gpa, "{s}.o", .{std.fs.path.stem(zcu.main_mod.root_src_path)}),
+                .path = try std.fmt.allocPrint(gpa, "{s}.o", .{
+                    std.fs.path.stem(zcu.main_mod.root_file.sub_path),
+                }),
                 .stack_pointer_sym = .null,
             };
             try zig_object.init(wasm);

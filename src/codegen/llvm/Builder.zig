@@ -7874,6 +7874,30 @@ pub const Metadata = enum(u32) {
         return metadata;
     }
 
+    pub fn populateCompileUnit(
+        cu: Metadata,
+        enums: []const Metadata,
+        globals: []const Metadata,
+        builder: *Builder,
+    ) !void {
+        const item = builder.metadata_items.get(@intFromEnum(cu));
+        switch (item.tag) {
+            .compile_unit, .@"compile_unit optimized" => {
+                const extra = builder.metadataExtraData(CompileUnit, item.data);
+                extra.enums.resolve(try builder.debugTuple(enums), builder);
+                extra.globals.resolve(try builder.debugTuple(globals), builder);
+            },
+            else => unreachable,
+        }
+    }
+
+    pub fn resolve(fwd_ref: Metadata, val: Metadata, builder: *const Builder) void {
+        assert(@intFromEnum(fwd_ref) >= Metadata.first_forward_reference and
+            @intFromEnum(fwd_ref) <= Metadata.first_local_metadata);
+        const index = @intFromEnum(fwd_ref) - Metadata.first_forward_reference;
+        builder.metadata_forward_references.items[index] = val;
+    }
+
     pub const Item = struct {
         tag: Tag,
         data: ExtraIndex,
@@ -8145,7 +8169,6 @@ pub const Metadata = enum(u32) {
         scope: Metadata,
         line: u32,
         ty: Metadata,
-        variable: Variable.Index,
     };
 
     pub const GlobalVarExpression = struct {
@@ -8657,12 +8680,6 @@ pub fn string(self: *Builder, bytes: []const u8) Allocator.Error!String {
 
 pub fn stringNull(self: *Builder, bytes: [:0]const u8) Allocator.Error!String {
     return self.string(bytes[0 .. bytes.len + 1]);
-}
-
-pub fn stringIfExists(self: *const Builder, bytes: []const u8) ?String {
-    return String.fromIndex(
-        self.string_map.getIndexAdapted(bytes, String.Adapter{ .builder = self }) orelse return null,
-    );
 }
 
 pub fn fmt(self: *Builder, comptime fmt_str: []const u8, fmt_args: anytype) Allocator.Error!String {
@@ -10312,8 +10329,8 @@ pub fn printUnbuffered(
                             else => extra.name,
                         },
                         .scope = extra.scope,
-                        .file = null,
-                        .line = null,
+                        .file = extra.file,
+                        .line = extra.line,
                         .baseType = extra.underlying_type,
                         .size = extra.bitSize(),
                         .@"align" = extra.bitAlign(),
@@ -10350,8 +10367,8 @@ pub fn printUnbuffered(
                             else => extra.name,
                         },
                         .scope = extra.scope,
-                        .file = null,
-                        .line = null,
+                        .file = extra.file,
+                        .line = extra.line,
                         .baseType = extra.underlying_type,
                         .size = extra.bitSize(),
                         .@"align" = extra.bitAlign(),
@@ -12075,36 +12092,6 @@ pub fn metadataStringFromStrtabString(self: *Builder, str: StrtabString) Allocat
     return try self.metadataString(str.slice(self).?);
 }
 
-pub fn metadataStringFmt(self: *Builder, comptime fmt_str: []const u8, fmt_args: anytype) Allocator.Error!MetadataString {
-    try self.metadata_string_map.ensureUnusedCapacity(self.gpa, 1);
-    try self.metadata_string_bytes.ensureUnusedCapacity(self.gpa, @intCast(std.fmt.count(fmt_str, fmt_args)));
-    try self.metadata_string_indices.ensureUnusedCapacity(self.gpa, 1);
-    return self.metadataStringFmtAssumeCapacity(fmt_str, fmt_args);
-}
-
-pub fn metadataStringFmtAssumeCapacity(self: *Builder, comptime fmt_str: []const u8, fmt_args: anytype) MetadataString {
-    self.metadata_string_bytes.writer(undefined).print(fmt_str, fmt_args) catch unreachable;
-    return self.trailingMetadataStringAssumeCapacity();
-}
-
-pub fn trailingMetadataString(self: *Builder) Allocator.Error!MetadataString {
-    try self.metadata_string_indices.ensureUnusedCapacity(self.gpa, 1);
-    try self.metadata_string_map.ensureUnusedCapacity(self.gpa, 1);
-    return self.trailingMetadataStringAssumeCapacity();
-}
-
-pub fn trailingMetadataStringAssumeCapacity(self: *Builder) MetadataString {
-    const start = self.metadata_string_indices.getLast();
-    const bytes: []const u8 = self.metadata_string_bytes.items[start..];
-    const gop = self.metadata_string_map.getOrPutAssumeCapacityAdapted(bytes, String.Adapter{ .builder = self });
-    if (gop.found_existing) {
-        self.metadata_string_bytes.shrinkRetainingCapacity(start);
-    } else {
-        self.metadata_string_indices.appendAssumeCapacity(@intCast(self.metadata_string_bytes.items.len));
-    }
-    return @enumFromInt(gop.index);
-}
-
 pub fn debugNamed(self: *Builder, name: MetadataString, operands: []const Metadata) Allocator.Error!void {
     try self.metadata_extra.ensureUnusedCapacity(self.gpa, operands.len);
     try self.metadata_named.ensureUnusedCapacity(self.gpa, 1);
@@ -12129,12 +12116,11 @@ pub fn debugCompileUnit(
     self: *Builder,
     file: Metadata,
     producer: MetadataString,
-    enums: Metadata,
-    globals: Metadata,
     options: Metadata.CompileUnit.Options,
 ) Allocator.Error!Metadata {
+    try self.metadata_forward_references.ensureUnusedCapacity(self.gpa, 2);
     try self.ensureUnusedMetadataCapacity(1, Metadata.CompileUnit, 0);
-    return self.debugCompileUnitAssumeCapacity(file, producer, enums, globals, options);
+    return self.debugCompileUnitAssumeCapacity(file, producer, options);
 }
 
 pub fn debugSubprogram(
@@ -12453,7 +12439,6 @@ pub fn debugGlobalVar(
     scope: Metadata,
     line: u32,
     ty: Metadata,
-    variable: Variable.Index,
     options: Metadata.GlobalVar.Options,
 ) Allocator.Error!Metadata {
     try self.ensureUnusedMetadataCapacity(1, Metadata.GlobalVar, 0);
@@ -12464,7 +12449,6 @@ pub fn debugGlobalVar(
         scope,
         line,
         ty,
-        variable,
         options,
     );
 }
@@ -12481,15 +12465,6 @@ pub fn debugGlobalVarExpression(
 pub fn debugConstant(self: *Builder, value: Constant) Allocator.Error!Metadata {
     try self.ensureUnusedMetadataCapacity(1, NoExtra, 0);
     return self.debugConstantAssumeCapacity(value);
-}
-
-pub fn debugForwardReferenceSetType(self: *Builder, fwd_ref: Metadata, ty: Metadata) void {
-    assert(
-        @intFromEnum(fwd_ref) >= Metadata.first_forward_reference and
-            @intFromEnum(fwd_ref) <= Metadata.first_local_metadata,
-    );
-    const index = @intFromEnum(fwd_ref) - Metadata.first_forward_reference;
-    self.metadata_forward_references.items[index] = ty;
 }
 
 fn metadataSimpleAssumeCapacity(self: *Builder, tag: Metadata.Tag, value: anytype) Metadata {
@@ -12596,8 +12571,6 @@ pub fn debugCompileUnitAssumeCapacity(
     self: *Builder,
     file: Metadata,
     producer: MetadataString,
-    enums: Metadata,
-    globals: Metadata,
     options: Metadata.CompileUnit.Options,
 ) Metadata {
     assert(!self.strip);
@@ -12606,8 +12579,8 @@ pub fn debugCompileUnitAssumeCapacity(
         Metadata.CompileUnit{
             .file = file,
             .producer = producer,
-            .enums = enums,
-            .globals = globals,
+            .enums = self.debugForwardReferenceAssumeCapacity(),
+            .globals = self.debugForwardReferenceAssumeCapacity(),
         },
     );
 }
@@ -13159,7 +13132,6 @@ fn debugGlobalVarAssumeCapacity(
     scope: Metadata,
     line: u32,
     ty: Metadata,
-    variable: Variable.Index,
     options: Metadata.GlobalVar.Options,
 ) Metadata {
     assert(!self.strip);
@@ -13172,7 +13144,6 @@ fn debugGlobalVarAssumeCapacity(
             .scope = scope,
             .line = line,
             .ty = ty,
-            .variable = variable,
         },
     );
 }

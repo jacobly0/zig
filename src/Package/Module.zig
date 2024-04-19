@@ -3,9 +3,8 @@
 //! to Zcu. https://github.com/ziglang/zig/issues/14307
 
 /// Only files inside this directory can be imported.
-root: Cache.Path,
-/// Relative to `root`. May contain path separators.
-root_src_path: []const u8,
+root_dir: Cache.Path,
+root_file: *File,
 /// Name used in compile errors. Looks like "root.foo.bar".
 fully_qualified_name: []const u8,
 /// The dependency table of this module. Shared dependencies such as 'std',
@@ -33,15 +32,10 @@ cc_argv: []const []const u8,
 /// (SPIR-V) whether to generate a structured control flow graph or not
 structured_cfg: bool,
 
-/// If the module is an `@import("builtin")` module, this is the `File` that
-/// is preallocated for it. Otherwise this field is null.
-builtin_file: ?*File,
+/// Whether the module is an `@import("builtin")` module.
+is_builtin: bool,
 
 pub const Deps = std.StringArrayHashMapUnmanaged(*Module);
-
-pub fn isBuiltin(m: Module) bool {
-    return m.builtin_file != null;
-}
 
 pub const Tree = struct {
     /// Each `Package` exposes a `Module` with build.zig as its root source file.
@@ -316,9 +310,10 @@ pub fn create(arena: Allocator, options: CreateOptions) !*Package.Module {
     };
 
     const mod = try arena.create(Module);
+    const file = try arena.create(File);
     mod.* = .{
-        .root = options.paths.root,
-        .root_src_path = options.paths.root_src_path,
+        .root_dir = options.paths.root,
+        .root_file = file,
         .fully_qualified_name = options.fully_qualified_name,
         .resolved_target = .{
             .result = target,
@@ -342,11 +337,24 @@ pub fn create(arena: Allocator, options: CreateOptions) !*Package.Module {
         .unwind_tables = unwind_tables,
         .cc_argv = options.cc_argv,
         .structured_cfg = structured_cfg,
-        .builtin_file = null,
+        .is_builtin = false,
+    };
+    file.* = .{
+        .root_decl = .none,
+        .status = .never_loaded,
+        .source_loaded = false,
+        .tree_loaded = false,
+        .zir_loaded = false,
+        .sub_path = options.paths.root_src_path,
+        .source = undefined,
+        .stat = undefined,
+        .tree = undefined,
+        .zir = undefined,
+        .mod = mod,
     };
 
-    const opt_builtin_mod = options.builtin_mod orelse b: {
-        if (!options.global.have_zcu) break :b null;
+    const opt_builtin_mod = options.builtin_mod orelse opt_builtin_mod: {
+        if (!options.global.have_zcu) break :opt_builtin_mod null;
 
         const generated_builtin_source = try Builtin.generate(.{
             .target = target,
@@ -369,17 +377,17 @@ pub fn create(arena: Allocator, options: CreateOptions) !*Package.Module {
             .wasi_exec_model = options.global.wasi_exec_model,
         }, arena);
 
-        const new = if (options.builtin_modules) |builtins| new: {
+        const builtin_mod = if (options.builtin_modules) |builtins| builtin_mod: {
             const gop = try builtins.getOrPut(arena, generated_builtin_source);
-            if (gop.found_existing) break :b gop.value_ptr.*;
-            errdefer builtins.removeByPtr(gop.key_ptr);
-            const new = try arena.create(Module);
-            gop.value_ptr.* = new;
-            break :new new;
+            if (!gop.found_existing) {
+                errdefer builtins.removeByPtr(gop.key_ptr);
+                gop.value_ptr.* = try arena.create(Module);
+            }
+            break :builtin_mod gop.value_ptr.*;
         } else try arena.create(Module);
         errdefer if (options.builtin_modules) |builtins| assert(builtins.remove(generated_builtin_source));
 
-        const new_file = try arena.create(File);
+        const builtin_file = try arena.create(File);
 
         const bin_digest, const hex_digest = digest: {
             var hasher: Cache.Hasher = Cache.hasher_init;
@@ -400,12 +408,12 @@ pub fn create(arena: Allocator, options: CreateOptions) !*Package.Module {
 
         const builtin_sub_path = try arena.dupe(u8, "b" ++ std.fs.path.sep_str ++ hex_digest);
 
-        new.* = .{
-            .root = .{
+        builtin_mod.* = .{
+            .root_dir = .{
                 .root_dir = options.global_cache_directory,
                 .sub_path = builtin_sub_path,
             },
-            .root_src_path = "builtin.zig",
+            .root_file = builtin_file,
             .fully_qualified_name = if (options.parent == null)
                 "builtin"
             else
@@ -432,25 +440,25 @@ pub fn create(arena: Allocator, options: CreateOptions) !*Package.Module {
             .unwind_tables = unwind_tables,
             .cc_argv = &.{},
             .structured_cfg = structured_cfg,
-            .builtin_file = new_file,
+            .is_builtin = true,
         };
-        new_file.* = .{
-            .sub_file_path = "builtin.zig",
-            .source = generated_builtin_source,
+        builtin_file.* = .{
+            .root_decl = .none,
+            .status = .never_loaded,
             .source_loaded = true,
             .tree_loaded = false,
             .zir_loaded = false,
+            .sub_path = "builtin.zig",
+            .source = generated_builtin_source,
             .stat = undefined,
             .tree = undefined,
             .zir = undefined,
-            .status = .never_loaded,
-            .mod = new,
-            .root_decl = .none,
+            .mod = builtin_mod,
             // We might as well use this digest for the File `path digest`, since there's a
             // one-to-one correspondence here between distinct paths and distinct contents.
             .path_digest = bin_digest,
         };
-        break :b new;
+        break :opt_builtin_mod builtin_mod;
     };
 
     if (opt_builtin_mod) |builtin_mod| {
@@ -464,17 +472,17 @@ pub fn create(arena: Allocator, options: CreateOptions) !*Package.Module {
 /// All fields correspond to `CreateOptions`.
 pub const LimitedOptions = struct {
     root: Cache.Path,
-    root_src_path: []const u8,
+    root_file: *File,
     fully_qualified_name: []const u8,
 };
 
 /// This one can only be used if the Module will only be used for AstGen and earlier in
 /// the pipeline. Illegal behavior occurs if a limited module touches Sema.
-pub fn createLimited(gpa: Allocator, options: LimitedOptions) Allocator.Error!*Package.Module {
-    const mod = try gpa.create(Module);
-    mod.* = .{
-        .root = options.root,
-        .root_src_path = options.root_src_path,
+pub fn createLimited(gpa: Allocator, options: LimitedOptions) Allocator.Error!void {
+    options.root_file.mod = try gpa.create(Module);
+    options.root_file.mod.* = .{
+        .root_dir = options.root,
+        .root_file = options.root_file,
         .fully_qualified_name = options.fully_qualified_name,
 
         .resolved_target = undefined,
@@ -494,18 +502,17 @@ pub fn createLimited(gpa: Allocator, options: LimitedOptions) Allocator.Error!*P
         .unwind_tables = undefined,
         .cc_argv = undefined,
         .structured_cfg = undefined,
-        .builtin_file = null,
+        .is_builtin = false,
     };
-    return mod;
 }
 
 /// Asserts that the module has a builtin module, which is not true for non-zig
 /// modules such as ones only used for `@embedFile`, or the root module when
 /// there is no Zig Compilation Unit.
 pub fn getBuiltinDependency(m: Module) *Module {
-    const result = m.deps.values()[0];
-    assert(result.isBuiltin());
-    return result;
+    const builtin_mod = m.deps.values()[0];
+    assert(builtin_mod.is_builtin);
+    return builtin_mod;
 }
 
 const Module = @This();

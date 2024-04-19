@@ -982,7 +982,7 @@ fn analyzeBodyInner(
         crash_info.setBodyIndex(i);
         const inst = body[i];
         std.log.scoped(.sema_zir).debug("sema ZIR {s} %{d}", .{
-            mod.namespacePtr(mod.declPtr(block.src_decl).src_namespace).file_scope.sub_file_path, inst,
+            mod.namespacePtr(mod.declPtr(block.src_decl).src_namespace).file_scope.sub_path, inst,
         });
         const air_inst: Air.Inst.Ref = switch (tags[@intFromEnum(inst)]) {
             // zig fmt: off
@@ -17543,7 +17543,7 @@ fn zirClosureGet(sema: *Sema, block: *Block, extended: Zir.Inst.Extended.InstDat
                 const tree = file.getTree(sema.gpa) catch |err| {
                     // In this case we emit a warning + a less precise source location.
                     log.warn("unable to load {s}: {s}", .{
-                        file.sub_file_path, @errorName(err),
+                        file.sub_path, @errorName(err),
                     });
                     break :name null;
                 };
@@ -17571,7 +17571,7 @@ fn zirClosureGet(sema: *Sema, block: *Block, extended: Zir.Inst.Extended.InstDat
                 const tree = file.getTree(sema.gpa) catch |err| {
                     // In this case we emit a warning + a less precise source location.
                     log.warn("unable to load {s}: {s}", .{
-                        file.sub_file_path, @errorName(err),
+                        file.sub_path, @errorName(err),
                     });
                     break :name null;
                 };

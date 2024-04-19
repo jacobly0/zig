@@ -423,7 +423,7 @@ pub fn createEmpty(
             self.files.set(index, .{ .zig_object = .{
                 .index = index,
                 .path = try std.fmt.allocPrint(arena, "{s}.o", .{fs.path.stem(
-                    zcu.main_mod.root_src_path,
+                    zcu.main_mod.root_file.sub_path,
                 )}),
             } });
             self.zig_object_index = index;

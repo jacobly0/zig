@@ -770,7 +770,7 @@ pub const Namespace = struct {
                 const decl = zcu.declPtr(cur_ns.decl_index);
                 count += decl.name.length(ip) + 1;
                 cur_ns = zcu.namespacePtr(cur_ns.parent.unwrap() orelse {
-                    count += ns.file_scope.sub_file_path.len;
+                    count += ns.file_scope.sub_path.len;
                     break :count count;
                 });
             }
@@ -819,7 +819,7 @@ pub const File = struct {
     zir_loaded: bool,
     /// Relative to the owning package's root_src_dir.
     /// Memory is stored in gpa, owned by File.
-    sub_file_path: []const u8,
+    sub_path: []const u8,
     /// Whether this is populated depends on `source_loaded`.
     source: [:0]const u8,
     /// Whether this is populated depends on `status`.
@@ -881,13 +881,12 @@ pub const File = struct {
 
     pub fn deinit(file: *File, mod: *Module) void {
         const gpa = mod.gpa;
-        const is_builtin = file.mod.isBuiltin();
-        log.debug("deinit File {s}", .{file.sub_file_path});
-        if (is_builtin) {
+        log.debug("deinit File {s}", .{file.sub_path});
+        if (file.mod.is_builtin) {
             file.unloadTree(gpa);
             file.unloadZir(gpa);
         } else {
-            gpa.free(file.sub_file_path);
+            if (file != file.mod.root_file) gpa.free(file.sub_path);
             file.unload(gpa);
         }
         file.references.deinit(gpa);
@@ -914,7 +913,7 @@ pub const File = struct {
 
         // Keep track of inode, file size, mtime, hash so we can detect which files
         // have been modified when an incremental update is requested.
-        var f = try file.mod.root.openFile(file.sub_file_path, .{});
+        var f = try file.mod.root_dir.openFile(file.sub_path, .{});
         defer f.close();
 
         const stat = try f.stat();
@@ -955,15 +954,15 @@ pub const File = struct {
 
     pub fn destroy(file: *File, mod: *Module) void {
         const gpa = mod.gpa;
-        const is_builtin = file.mod.isBuiltin();
+        const is_root = file == file.mod.root_file;
         file.deinit(mod);
-        if (!is_builtin) gpa.destroy(file);
+        if (!is_root) gpa.destroy(file);
     }
 
     pub fn renderFullyQualifiedName(file: File, writer: anytype) !void {
         // Convert all the slashes into dots and truncate the extension.
-        const ext = std.fs.path.extension(file.sub_file_path);
-        const noext = file.sub_file_path[0 .. file.sub_file_path.len - ext.len];
+        const ext = std.fs.path.extension(file.sub_path);
+        const noext = file.sub_path[0 .. file.sub_path.len - ext.len];
         for (noext) |byte| switch (byte) {
             '/', '\\' => try writer.writeByte('.'),
             else => try writer.writeByte(byte),
@@ -971,7 +970,7 @@ pub const File = struct {
     }
 
     pub fn renderFullyQualifiedDebugName(file: File, writer: anytype) !void {
-        for (file.sub_file_path) |byte| switch (byte) {
+        for (file.sub_path) |byte| switch (byte) {
             '/', '\\' => try writer.writeByte('/'),
             else => try writer.writeByte(byte),
         };
@@ -985,12 +984,12 @@ pub const File = struct {
     }
 
     pub fn fullPath(file: File, ally: Allocator) ![]u8 {
-        return file.mod.root.joinString(ally, file.sub_file_path);
+        return file.mod.root_dir.joinString(ally, file.sub_path);
     }
 
     pub fn dumpSrc(file: *File, src: LazySrcLoc) void {
         const loc = std.zig.findLineColumn(file.source.bytes, src);
-        std.debug.print("{s}:{d}:{d}\n", .{ file.sub_file_path, loc.line + 1, loc.column + 1 });
+        std.debug.print("{s}:{d}:{d}\n", .{ file.sub_path, loc.line + 1, loc.column + 1 });
     }
 
     pub fn okToReportErrors(file: File) bool {
@@ -1063,7 +1062,7 @@ pub const File = struct {
 
 pub const EmbedFile = struct {
     /// Relative to the owning module's root directory.
-    sub_file_path: InternPool.NullTerminatedString,
+    sub_path: InternPool.NullTerminatedString,
     /// Module that this file is a part of, managed externally.
     owner: *Package.Module,
     stat: Cache.File.Stat,
@@ -2098,7 +2097,7 @@ comptime {
 }
 
 pub fn astGenFile(mod: *Module, file: *File) !void {
-    assert(!file.mod.isBuiltin());
+    assert(!file.mod.is_builtin);
 
     const tracy = trace(@src());
     defer tracy.end();
@@ -2107,7 +2106,7 @@ pub fn astGenFile(mod: *Module, file: *File) !void {
     const gpa = mod.gpa;
 
     // In any case we need to examine the stat of the file to determine the course of action.
-    var source_file = try file.mod.root.openFile(file.sub_file_path, .{});
+    var source_file = try file.mod.root_dir.openFile(file.sub_path, .{});
     defer source_file.close();
 
     const stat = try source_file.stat();
@@ -2118,10 +2117,10 @@ pub fn astGenFile(mod: *Module, file: *File) !void {
         path_hash.addBytes(build_options.version);
         path_hash.add(builtin.zig_backend);
         if (!want_local_cache) {
-            path_hash.addOptionalBytes(file.mod.root.root_dir.path);
-            path_hash.addBytes(file.mod.root.sub_path);
+            path_hash.addOptionalBytes(file.mod.root_dir.root_dir.path);
+            path_hash.addBytes(file.mod.root_dir.sub_path);
         }
-        path_hash.addBytes(file.sub_file_path);
+        path_hash.addBytes(file.sub_path);
         var bin: Cache.BinDigest = undefined;
         path_hash.hasher.final(&bin);
         break :hash bin;
@@ -2144,7 +2143,7 @@ pub fn astGenFile(mod: *Module, file: *File) !void {
         .never_loaded, .retryable_failure => lock: {
             // First, load the cached ZIR code, if any.
             log.debug("AstGen checking cache: {s} (local={}, digest={s})", .{
-                file.sub_file_path, want_local_cache, &hex_digest,
+                file.sub_path, want_local_cache, &hex_digest,
             });
 
             break :lock .shared;
@@ -2156,11 +2155,11 @@ pub fn astGenFile(mod: *Module, file: *File) !void {
                 stat.inode == file.stat.inode;
 
             if (unchanged_metadata) {
-                log.debug("unmodified metadata of file: {s}", .{file.sub_file_path});
+                log.debug("unmodified metadata of file: {s}", .{file.sub_path});
                 return;
             }
 
-            log.debug("metadata changed: {s}", .{file.sub_file_path});
+            log.debug("metadata changed: {s}", .{file.sub_path});
 
             break :lock .exclusive;
         },
@@ -2208,16 +2207,16 @@ pub fn astGenFile(mod: *Module, file: *File) !void {
                 stat.inode == header.stat_inode;
 
             if (!unchanged_metadata) {
-                log.debug("AstGen cache stale: {s}", .{file.sub_file_path});
+                log.debug("AstGen cache stale: {s}", .{file.sub_path});
                 break :update;
             }
             log.debug("AstGen cache hit: {s} instructions_len={d}", .{
-                file.sub_file_path, header.instructions_len,
+                file.sub_path, header.instructions_len,
             });
 
             file.zir = loadZirCacheBody(gpa, header, cache_file) catch |err| switch (err) {
                 error.UnexpectedFileSize => {
-                    log.warn("unexpected EOF reading cached ZIR for {s}", .{file.sub_file_path});
+                    log.warn("unexpected EOF reading cached ZIR for {s}", .{file.sub_path});
                     break :update;
                 },
                 else => |e| return e,
@@ -2229,7 +2228,7 @@ pub fn astGenFile(mod: *Module, file: *File) !void {
                 .mtime = header.stat_mtime,
             };
             file.status = .success_zir;
-            log.debug("AstGen cached success: {s}", .{file.sub_file_path});
+            log.debug("AstGen cached success: {s}", .{file.sub_path});
 
             // TODO don't report compile errors until Sema @importFile
             if (file.zir.hasCompileErrors()) {
@@ -2303,7 +2302,7 @@ pub fn astGenFile(mod: *Module, file: *File) !void {
     file.zir = try AstGen.generate(gpa, file.tree);
     file.zir_loaded = true;
     file.status = .success_zir;
-    log.debug("AstGen fresh success: {s}", .{file.sub_file_path});
+    log.debug("AstGen fresh success: {s}", .{file.sub_path});
 
     const safety_buffer = if (data_has_safety_tag)
         try gpa.alloc([8]u8, file.zir.instructions.len)
@@ -2358,7 +2357,7 @@ pub fn astGenFile(mod: *Module, file: *File) !void {
     };
     cache_file.writevAll(&iovecs) catch |err| {
         log.warn("unable to write cached ZIR code for {}{s} to {}{s}: {s}", .{
-            file.mod.root, file.sub_file_path, cache_directory, &hex_digest, @errorName(err),
+            file.mod.root_dir, file.sub_path, cache_directory, &hex_digest, @errorName(err),
         });
     };
 
@@ -3384,7 +3383,7 @@ fn semaFileUpdate(zcu: *Zcu, file: *File, type_outdated: bool) SemaError!bool {
 
     log.debug("semaFileUpdate mod={s} sub_file_path={s} type_outdated={}", .{
         file.mod.fully_qualified_name,
-        file.sub_file_path,
+        file.sub_path,
         type_outdated,
     });
 
@@ -3447,7 +3446,7 @@ fn semaFile(mod: *Module, file: *File) SemaError!void {
 
     const gpa = mod.gpa;
     log.debug("semaFile mod={s} sub_file_path={s}", .{
-        file.mod.fully_qualified_name, file.sub_file_path,
+        file.mod.fully_qualified_name, file.sub_path,
     });
 
     // Because these three things each reference each other, `undefined`
@@ -3493,9 +3492,9 @@ fn semaFile(mod: *Module, file: *File) SemaError!void {
             };
 
             const resolved_path = std.fs.path.resolve(gpa, &.{
-                file.mod.root.root_dir.path orelse ".",
-                file.mod.root.sub_path,
-                file.sub_file_path,
+                file.mod.root_dir.root_dir.path orelse ".",
+                file.mod.root_dir.sub_path,
+                file.sub_path,
             }) catch |err| {
                 try reportRetryableFileError(mod, file, "unable to resolve path: {s}", .{@errorName(err)});
                 return error.AnalysisFail;
@@ -3847,60 +3846,21 @@ pub fn importPkg(zcu: *Zcu, mod: *Package.Module) !ImportFileResult {
     // an import refers to the same as another, despite different relative paths
     // or differently mapped package names.
     const resolved_path = try std.fs.path.resolve(gpa, &.{
-        mod.root.root_dir.path orelse ".",
-        mod.root.sub_path,
-        mod.root_src_path,
+        mod.root_dir.root_dir.path orelse ".",
+        mod.root_dir.sub_path,
+        mod.root_file.sub_path,
     });
     var keep_resolved_path = false;
     defer if (!keep_resolved_path) gpa.free(resolved_path);
 
     const gop = try zcu.import_table.getOrPut(gpa, resolved_path);
     errdefer _ = zcu.import_table.pop();
-    if (gop.found_existing) {
-        try gop.value_ptr.*.addReference(zcu.*, .{ .root = mod });
-        return ImportFileResult{
-            .file = gop.value_ptr.*,
-            .is_new = false,
-            .is_pkg = true,
-        };
-    }
-
-    if (mod.builtin_file) |builtin_file| {
-        keep_resolved_path = true; // It's now owned by import_table.
-        gop.value_ptr.* = builtin_file;
-        try builtin_file.addReference(zcu.*, .{ .root = mod });
-        return .{
-            .file = builtin_file,
-            .is_new = false,
-            .is_pkg = true,
-        };
-    }
-
-    const sub_file_path = try gpa.dupe(u8, mod.root_src_path);
-    errdefer gpa.free(sub_file_path);
-
-    const new_file = try gpa.create(File);
-    errdefer gpa.destroy(new_file);
-
-    keep_resolved_path = true; // It's now owned by import_table.
-    gop.value_ptr.* = new_file;
-    new_file.* = .{
-        .sub_file_path = sub_file_path,
-        .source = undefined,
-        .source_loaded = false,
-        .tree_loaded = false,
-        .zir_loaded = false,
-        .stat = undefined,
-        .tree = undefined,
-        .zir = undefined,
-        .status = .never_loaded,
-        .mod = mod,
-        .root_decl = .none,
-    };
-    try new_file.addReference(zcu.*, .{ .root = mod });
-    return ImportFileResult{
-        .file = new_file,
-        .is_new = true,
+    keep_resolved_path = !gop.found_existing; // It's now owned by import_table.
+    if (!gop.found_existing) gop.value_ptr.* = mod.root_file;
+    try gop.value_ptr.*.addReference(zcu.*, .{ .root = mod });
+    return .{
+        .file = gop.value_ptr.*,
+        .is_new = !gop.found_existing,
         .is_pkg = true,
     };
 }
@@ -3928,9 +3888,9 @@ pub fn importFile(
     // an import refers to the same as another, despite different relative paths
     // or differently mapped package names.
     const resolved_path = try std.fs.path.resolve(gpa, &.{
-        cur_file.mod.root.root_dir.path orelse ".",
-        cur_file.mod.root.sub_path,
-        cur_file.sub_file_path,
+        cur_file.mod.root_dir.root_dir.path orelse ".",
+        cur_file.mod.root_dir.sub_path,
+        cur_file.sub_path,
         "..",
         import_string,
     });
@@ -3950,12 +3910,12 @@ pub fn importFile(
     errdefer gpa.destroy(new_file);
 
     const resolved_root_path = try std.fs.path.resolve(gpa, &.{
-        cur_file.mod.root.root_dir.path orelse ".",
-        cur_file.mod.root.sub_path,
+        cur_file.mod.root_dir.root_dir.path orelse ".",
+        cur_file.mod.root_dir.sub_path,
     });
     defer gpa.free(resolved_root_path);
 
-    const sub_file_path = p: {
+    const sub_path = p: {
         const relative = try std.fs.path.relative(gpa, resolved_root_path, resolved_path);
         errdefer gpa.free(relative);
 
@@ -3964,16 +3924,16 @@ pub fn importFile(
         }
         return error.ImportOutsideModulePath;
     };
-    errdefer gpa.free(sub_file_path);
+    errdefer gpa.free(sub_path);
 
     log.debug("new importFile. resolved_root_path={s}, resolved_path={s}, sub_file_path={s}, import_string={s}", .{
-        resolved_root_path, resolved_path, sub_file_path, import_string,
+        resolved_root_path, resolved_path, sub_path, import_string,
     });
 
     keep_resolved_path = true; // It's now owned by import_table.
     gop.value_ptr.* = new_file;
     new_file.* = .{
-        .sub_file_path = sub_file_path,
+        .sub_path = sub_path,
         .source = undefined,
         .source_loaded = false,
         .tree_loaded = false,
@@ -4002,9 +3962,9 @@ pub fn embedFile(
 
     if (cur_file.mod.deps.get(import_string)) |pkg| {
         const resolved_path = try std.fs.path.resolve(gpa, &.{
-            pkg.root.root_dir.path orelse ".",
-            pkg.root.sub_path,
-            pkg.root_src_path,
+            pkg.root_dir.root_dir.path orelse ".",
+            pkg.root_dir.sub_path,
+            pkg.root_file.sub_path,
         });
         var keep_resolved_path = false;
         defer if (!keep_resolved_path) gpa.free(resolved_path);
@@ -4017,18 +3977,18 @@ pub fn embedFile(
         if (gop.found_existing) return gop.value_ptr.*.val;
         keep_resolved_path = true;
 
-        const sub_file_path = try gpa.dupe(u8, pkg.root_src_path);
-        errdefer gpa.free(sub_file_path);
+        const sub_path = try gpa.dupe(u8, pkg.root_file.sub_path);
+        errdefer gpa.free(sub_path);
 
-        return newEmbedFile(mod, pkg, sub_file_path, resolved_path, gop.value_ptr, src_loc);
+        return newEmbedFile(mod, pkg, sub_path, resolved_path, gop.value_ptr, src_loc);
     }
 
     // The resolved path is used as the key in the table, to detect if a file
     // refers to the same as another, despite different relative paths.
     const resolved_path = try std.fs.path.resolve(gpa, &.{
-        cur_file.mod.root.root_dir.path orelse ".",
-        cur_file.mod.root.sub_path,
-        cur_file.sub_file_path,
+        cur_file.mod.root_dir.root_dir.path orelse ".",
+        cur_file.mod.root_dir.sub_path,
+        cur_file.sub_path,
         "..",
         import_string,
     });
@@ -4045,12 +4005,12 @@ pub fn embedFile(
     keep_resolved_path = true;
 
     const resolved_root_path = try std.fs.path.resolve(gpa, &.{
-        cur_file.mod.root.root_dir.path orelse ".",
-        cur_file.mod.root.sub_path,
+        cur_file.mod.root_dir.root_dir.path orelse ".",
+        cur_file.mod.root_dir.sub_path,
     });
     defer gpa.free(resolved_root_path);
 
-    const sub_file_path = p: {
+    const sub_path = p: {
         const relative = try std.fs.path.relative(gpa, resolved_root_path, resolved_path);
         errdefer gpa.free(relative);
 
@@ -4059,16 +4019,16 @@ pub fn embedFile(
         }
         return error.ImportOutsideModulePath;
     };
-    defer gpa.free(sub_file_path);
+    defer gpa.free(sub_path);
 
-    return newEmbedFile(mod, cur_file.mod, sub_file_path, resolved_path, gop.value_ptr, src_loc);
+    return newEmbedFile(mod, cur_file.mod, sub_path, resolved_path, gop.value_ptr, src_loc);
 }
 
 /// https://github.com/ziglang/zig/issues/14307
 fn newEmbedFile(
     mod: *Module,
     pkg: *Package.Module,
-    sub_file_path: []const u8,
+    sub_path: []const u8,
     resolved_path: []const u8,
     result: **EmbedFile,
     src_loc: SrcLoc,
@@ -4079,7 +4039,7 @@ fn newEmbedFile(
     const new_file = try gpa.create(EmbedFile);
     errdefer gpa.destroy(new_file);
 
-    var file = try pkg.root.openFile(sub_file_path, .{});
+    var file = try pkg.root_dir.openFile(sub_path, .{});
     defer file.close();
 
     const actual_stat = try file.stat();
@@ -4136,7 +4096,7 @@ fn newEmbedFile(
 
     result.* = new_file;
     new_file.* = .{
-        .sub_file_path = try ip.getOrPutString(gpa, sub_file_path, .no_embedded_nulls),
+        .sub_path = try ip.getOrPutString(gpa, sub_path, .no_embedded_nulls),
         .owner = pkg,
         .stat = stat,
         .val = ptr_val,
@@ -4397,7 +4357,7 @@ fn scanDecl(iter: *ScanDeclIter, decl_inst: Zir.Inst.Index) Allocator.Error!void
         // re-analysis for us if necessary.
         if (prev_exported != declaration.flags.is_export or decl.analysis == .unreferenced) {
             log.debug("scanDecl queue analyze_decl file='{s}' decl_name='{}' decl_index={d}", .{
-                namespace.file_scope.sub_file_path, decl_name.fmt(ip), decl_index,
+                namespace.file_scope.sub_path, decl_name.fmt(ip), decl_index,
             });
             comp.work_queue.writeItemAssumeCapacity(.{ .analyze_decl = decl_index });
         }
@@ -4911,7 +4871,7 @@ pub const SwitchProngSrc = union(enum) {
         const tree = decl.getFileScope(mod).getTree(gpa) catch |err| {
             // In this case we emit a warning + a less precise source location.
             log.warn("unable to load {s}: {s}", .{
-                decl.getFileScope(mod).sub_file_path, @errorName(err),
+                decl.getFileScope(mod).sub_path, @errorName(err),
             });
             return LazySrcLoc.nodeOffset(0);
         };
@@ -5059,7 +5019,7 @@ pub const PeerTypeCandidateSrc = union(enum) {
                 const tree = decl.getFileScope(mod).getTree(gpa) catch |err| {
                     // In this case we emit a warning + a less precise source location.
                     log.warn("unable to load {s}: {s}", .{
-                        decl.getFileScope(mod).sub_file_path, @errorName(err),
+                        decl.getFileScope(mod).sub_path, @errorName(err),
                     });
                     return LazySrcLoc.nodeOffset(0);
                 };
@@ -5127,7 +5087,7 @@ pub fn paramSrc(
     const tree = decl.getFileScope(mod).getTree(gpa) catch |err| {
         // In this case we emit a warning + a less precise source location.
         log.warn("unable to load {s}: {s}", .{
-            decl.getFileScope(mod).sub_file_path, @errorName(err),
+            decl.getFileScope(mod).sub_path, @errorName(err),
         });
         return LazySrcLoc.nodeOffset(0);
     };
@@ -5159,7 +5119,7 @@ pub fn initSrc(
     const tree = decl.getFileScope(mod).getTree(gpa) catch |err| {
         // In this case we emit a warning + a less precise source location.
         log.warn("unable to load {s}: {s}", .{
-            decl.getFileScope(mod).sub_file_path, @errorName(err),
+            decl.getFileScope(mod).sub_path, @errorName(err),
         });
         return LazySrcLoc.nodeOffset(0);
     };
@@ -5201,7 +5161,7 @@ pub fn optionsSrc(mod: *Module, decl: *Decl, base_src: LazySrcLoc, wanted: []con
     const tree = decl.getFileScope(mod).getTree(gpa) catch |err| {
         // In this case we emit a warning + a less precise source location.
         log.warn("unable to load {s}: {s}", .{
-            decl.getFileScope(mod).sub_file_path, @errorName(err),
+            decl.getFileScope(mod).sub_path, @errorName(err),
         });
         return LazySrcLoc.nodeOffset(0);
     };
@@ -6071,7 +6031,7 @@ pub fn fieldSrcLoc(mod: *Module, owner_decl_index: Decl.Index, query: FieldSrcQu
     const tree = file.getTree(mod.gpa) catch |err| {
         // In this case we emit a warning + a less precise source location.
         log.warn("unable to load {s}: {s}", .{
-            file.sub_file_path, @errorName(err),
+            file.sub_path, @errorName(err),
         });
         return owner_decl.srcLoc(mod);
     };

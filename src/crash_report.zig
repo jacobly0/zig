@@ -127,15 +127,15 @@ fn dumpStatusReport() !void {
 var crash_heap: [16 * 4096]u8 = undefined;
 
 fn writeFilePath(file: *Module.File, writer: anytype) !void {
-    if (file.mod.root.root_dir.path) |path| {
+    if (file.mod.root_dir.root_dir.path) |path| {
         try writer.writeAll(path);
         try writer.writeAll(std.fs.path.sep_str);
     }
-    if (file.mod.root.sub_path.len > 0) {
-        try writer.writeAll(file.mod.root.sub_path);
+    if (file.mod.root_dir.sub_path.len > 0) {
+        try writer.writeAll(file.mod.root_dir.sub_path);
         try writer.writeAll(std.fs.path.sep_str);
     }
-    try writer.writeAll(file.sub_file_path);
+    try writer.writeAll(file.sub_path);
 }
 
 fn writeFullyQualifiedDeclWithFile(mod: *Module, decl: *Decl, writer: anytype) !void {

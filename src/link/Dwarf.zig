@@ -2005,7 +2005,7 @@ pub fn writeDbgInfoHeader(self: *Dwarf, zcu: *Module, low_pc: u64, high_pc: u64)
     di_buf.appendAssumeCapacity(self.ptrWidthBytes()); // address size
 
     // Write the form for the compile unit, which must match the abbrev table above.
-    const name_strp = try self.strtab.insert(self.allocator, zcu.root_mod.root_src_path);
+    const name_strp = try self.strtab.insert(self.allocator, zcu.root_mod.root_file.sub_path);
     var compile_unit_dir_buffer: [std.fs.MAX_PATH_BYTES]u8 = undefined;
     const compile_unit_dir = resolveCompilationDir(zcu, &compile_unit_dir_buffer);
     const comp_dir_strp = try self.strtab.insert(self.allocator, compile_unit_dir);
@@ -2064,8 +2064,8 @@ fn resolveCompilationDir(module: *Module, buffer: *[std.fs.MAX_PATH_BYTES]u8) []
     // be very location dependent.
     // TODO: the only concern I have with this is WASI as either host or target, should
     // we leave the paths as relative then?
-    const root_dir_path = module.root_mod.root.root_dir.path orelse ".";
-    const sub_path = module.root_mod.root.sub_path;
+    const root_dir_path = module.root_mod.root_dir.root_dir.path orelse ".";
+    const sub_path = module.root_mod.root_dir.sub_path;
     const realpath = if (std.fs.path.isAbsolute(root_dir_path)) r: {
         @memcpy(buffer[0..root_dir_path.len], root_dir_path);
         break :r root_dir_path;
@@ -2800,7 +2800,7 @@ fn genIncludeDirsAndFileNames(self: *Dwarf, arena: Allocator) !struct {
     try files_dir_indexes.ensureTotalCapacity(self.di_files.count());
 
     for (self.di_files.keys()) |dif| {
-        const full_path = try dif.mod.root.joinString(arena, dif.sub_file_path);
+        const full_path = try dif.mod.root_dir.joinString(arena, dif.sub_path);
         const dir_path = std.fs.path.dirname(full_path) orelse ".";
         const sub_file_path = std.fs.path.basename(full_path);
         // https://github.com/ziglang/zig/issues/19353

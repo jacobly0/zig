@@ -224,12 +224,12 @@ pub fn append(opts: @This(), buffer: *std.ArrayList(u8)) Allocator.Error!void {
 pub fn populateFile(comp: *Compilation, mod: *Module, file: *File) !void {
     assert(file.source_loaded == true);
 
-    if (mod.root.statFile(mod.root_src_path)) |stat| {
+    if (mod.root_dir.statFile(mod.root_file.sub_path)) |stat| {
         if (stat.size != file.source.len) {
             std.log.warn(
                 "the cached file '{}{s}' had the wrong size. Expected {d}, found {d}. " ++
                     "Overwriting with correct file contents now",
-                .{ mod.root, mod.root_src_path, file.source.len, stat.size },
+                .{ mod.root_dir, mod.root_file.sub_path, file.source.len, stat.size },
             );
 
             try writeFile(file, mod);
@@ -251,7 +251,7 @@ pub fn populateFile(comp: *Compilation, mod: *Module, file: *File) !void {
         else => |e| return e,
     }
 
-    log.debug("parsing and generating '{s}'", .{mod.root_src_path});
+    log.debug("parsing and generating '{s}'", .{mod.root_file.sub_path});
 
     file.tree = try std.zig.Ast.parse(comp.gpa, file.source, .zig);
     assert(file.tree.errors.len == 0); // builtin.zig must parse
@@ -267,7 +267,7 @@ pub fn populateFile(comp: *Compilation, mod: *Module, file: *File) !void {
 
 fn writeFile(file: *File, mod: *Module) !void {
     var buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
-    var af = try mod.root.atomicFile(mod.root_src_path, .{ .make_path = true }, &buf);
+    var af = try mod.root_dir.atomicFile(mod.root_file.sub_path, .{ .make_path = true }, &buf);
     defer af.deinit();
     try af.file.writeAll(file.source);
     af.finish() catch |err| switch (err) {
