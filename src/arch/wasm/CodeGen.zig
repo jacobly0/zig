@@ -767,7 +767,7 @@ pub fn deinit(func: *CodeGen) void {
 /// Sets `err_msg` on `CodeGen` and returns `error.CodegenFail` which is caught in link/Wasm.zig
 fn fail(func: *CodeGen, comptime fmt: []const u8, args: anytype) InnerError {
     const mod = func.bin_file.base.comp.module.?;
-    const src_loc = func.decl.navSrcLoc(mod).upgrade(mod);
+    const src_loc = func.decl.navSrcLoc(mod);
     func.err_msg = try Module.ErrorMsg.create(func.gpa, src_loc, fmt, args);
     return error.CodegenFail;
 }
@@ -1204,7 +1204,7 @@ fn genFunctype(
 
 pub fn generate(
     bin_file: *link.File,
-    src_loc: Module.SrcLoc,
+    src_loc: Module.LazySrcLoc,
     func_index: InternPool.Index,
     air: Air,
     liveness: Liveness,
@@ -3153,7 +3153,7 @@ fn lowerAnonDeclRef(
     }
 
     const decl_align = mod.intern_pool.indexToKey(anon_decl.orig_ty).ptr_type.flags.alignment;
-    const res = try func.bin_file.lowerAnonDecl(decl_val, decl_align, func.decl.navSrcLoc(mod).upgrade(mod));
+    const res = try func.bin_file.lowerAnonDecl(decl_val, decl_align, func.decl.navSrcLoc(mod));
     switch (res) {
         .ok => {},
         .fail => |em| {
