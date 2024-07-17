@@ -395,6 +395,13 @@ pub fn freeRelocs(self: Atom, elf_file: *Elf) void {
     zig_object.relocs.items[self.relocs_section_index].clearRetainingCapacity();
 }
 
+pub fn hasRelocs(self: Atom, elf_file: *Elf) bool {
+    const file_ptr = self.file(elf_file).?;
+    assert(file_ptr == .zig_object);
+    const zig_object = file_ptr.zig_object;
+    return zig_object.relocs.items[self.relocs_section_index].items.len > 0;
+}
+
 pub fn scanRelocsRequiresCode(self: Atom, elf_file: *Elf) bool {
     const cpu_arch = elf_file.getTarget().cpu.arch;
     for (self.relocs(elf_file)) |rel| {

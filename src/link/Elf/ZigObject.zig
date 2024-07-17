@@ -845,6 +845,7 @@ fn getDeclShdrIndex(
     self: *ZigObject,
     elf_file: *Elf,
     decl: *const Module.Decl,
+    sym_index: Symbol.Index,
     code: []const u8,
 ) error{OutOfMemory}!u32 {
     _ = self;
@@ -855,10 +856,11 @@ fn getDeclShdrIndex(
         else => blk: {
             if (decl.getOwnedVariable(mod)) |variable| {
                 if (variable.is_threadlocal and any_non_single_threaded) {
-                    const is_all_zeroes = for (code) |byte| {
+                    const has_relocs = elf_file.symbol(sym_index).atom(elf_file).?.hasRelocs(elf_file);
+                    const is_bss = !has_relocs and for (code) |byte| {
                         if (byte != 0) break false;
                     } else true;
-                    if (is_all_zeroes) break :blk elf_file.sectionByName(".tbss") orelse try elf_file.addSection(.{
+                    if (is_bss) break :blk elf_file.sectionByName(".tbss") orelse try elf_file.addSection(.{
                         .type = elf.SHT_NOBITS,
                         .flags = elf.SHF_ALLOC | elf.SHF_WRITE | elf.SHF_TLS,
                         .name = ".tbss",
@@ -883,10 +885,11 @@ fn getDeclShdrIndex(
                 }
                 // TODO I blatantly copied the logic from the Wasm linker, but is there a less
                 // intrusive check for all zeroes than this?
-                const is_all_zeroes = for (code) |byte| {
+                const has_relocs = elf_file.symbol(sym_index).atom(elf_file).?.hasRelocs(elf_file);
+                const is_bss = !has_relocs and for (code) |byte| {
                     if (byte != 0) break false;
                 } else true;
-                if (is_all_zeroes) break :blk elf_file.zig_bss_section_index.?;
+                if (is_bss) break :blk elf_file.zig_bss_section_index.?;
                 break :blk elf_file.zig_data_section_index.?;
             }
             break :blk elf_file.zig_data_rel_ro_section_index.?;
@@ -1099,7 +1102,7 @@ pub fn updateFunc(
         },
     };
 
-    const shndx = try self.getDeclShdrIndex(elf_file, decl, code);
+    const shndx = try self.getDeclShdrIndex(elf_file, decl, sym_index, code);
     try self.updateDeclCode(elf_file, pt, decl_index, sym_index, shndx, code, elf.STT_FUNC);
 
     if (decl_state) |*ds| {
@@ -1174,7 +1177,7 @@ pub fn updateDecl(
         },
     };
 
-    const shndx = try self.getDeclShdrIndex(elf_file, decl, code);
+    const shndx = try self.getDeclShdrIndex(elf_file, decl, sym_index, code);
     if (elf_file.shdrs.items[shndx].sh_flags & elf.SHF_TLS != 0)
         try self.updateTlv(elf_file, pt, decl_index, sym_index, shndx, code)
     else
