@@ -652,6 +652,10 @@ pub fn getDeclVAddr(
     reloc_info: link.File.RelocInfo,
 ) !u64 {
     const this_sym_index = try self.getOrCreateMetadataForDecl(elf_file, decl_index);
+
+    elf_file.base.linker_mutex.lock();
+    defer elf_file.base.linker_mutex.unlock();
+
     const this_sym = elf_file.symbol(this_sym_index);
     const vaddr = this_sym.address(.{}, elf_file);
     const parent_atom = elf_file.symbol(reloc_info.parent_atom_index).atom(elf_file).?;
@@ -670,6 +674,9 @@ pub fn getAnonDeclVAddr(
     decl_val: InternPool.Index,
     reloc_info: link.File.RelocInfo,
 ) !u64 {
+    elf_file.base.linker_mutex.lock();
+    defer elf_file.base.linker_mutex.unlock();
+
     const sym_index = self.anon_decls.get(decl_val).?.symbol_index;
     const sym = elf_file.symbol(sym_index);
     const vaddr = sym.address(.{}, elf_file);
@@ -698,10 +705,15 @@ pub fn lowerAnonDecl(
         .none => ty.abiAlignment(pt),
         else => explicit_alignment,
     };
-    if (self.anon_decls.get(decl_val)) |metadata| {
-        const existing_alignment = elf_file.symbol(metadata.symbol_index).atom(elf_file).?.alignment;
-        if (decl_alignment.order(existing_alignment).compare(.lte))
-            return .ok;
+
+    {
+        elf_file.base.linker_mutex.lock();
+        defer elf_file.base.linker_mutex.unlock();
+        if (self.anon_decls.get(decl_val)) |metadata| {
+            const existing_alignment = elf_file.symbol(metadata.symbol_index).atom(elf_file).?.alignment;
+            if (decl_alignment.order(existing_alignment).compare(.lte))
+                return .ok;
+        }
     }
 
     const val = Value.fromInterned(decl_val);
@@ -730,6 +742,8 @@ pub fn lowerAnonDecl(
         .ok => |sym_index| sym_index,
         .fail => |em| return .{ .fail = em },
     };
+    elf_file.base.linker_mutex.lock();
+    defer elf_file.base.linker_mutex.unlock();
     try self.anon_decls.put(gpa, decl_val, .{ .symbol_index = sym_index });
     return .ok;
 }
@@ -742,34 +756,40 @@ pub fn getOrCreateMetadataForLazySymbol(
 ) !Symbol.Index {
     const mod = pt.zcu;
     const gpa = mod.gpa;
-    const gop = try self.lazy_syms.getOrPut(gpa, lazy_sym.getDecl(mod));
-    errdefer _ = if (!gop.found_existing) self.lazy_syms.pop();
-    if (!gop.found_existing) gop.value_ptr.* = .{};
-    const metadata: struct {
-        symbol_index: *Symbol.Index,
-        state: *LazySymbolMetadata.State,
-    } = switch (lazy_sym.kind) {
-        .code => .{
-            .symbol_index = &gop.value_ptr.text_symbol_index,
-            .state = &gop.value_ptr.text_state,
-        },
-        .const_data => .{
-            .symbol_index = &gop.value_ptr.rodata_symbol_index,
-            .state = &gop.value_ptr.rodata_state,
-        },
+
+    const symbol_index = symbol_index: {
+        elf_file.base.linker_mutex.lock();
+        defer elf_file.base.linker_mutex.unlock();
+
+        const gop = try self.lazy_syms.getOrPut(gpa, lazy_sym.getDecl(mod));
+        errdefer _ = if (!gop.found_existing) self.lazy_syms.pop();
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        const metadata: struct {
+            symbol_index: *Symbol.Index,
+            state: *LazySymbolMetadata.State,
+        } = switch (lazy_sym.kind) {
+            .code => .{
+                .symbol_index = &gop.value_ptr.text_symbol_index,
+                .state = &gop.value_ptr.text_state,
+            },
+            .const_data => .{
+                .symbol_index = &gop.value_ptr.rodata_symbol_index,
+                .state = &gop.value_ptr.rodata_state,
+            },
+        };
+        switch (metadata.state.*) {
+            .unused => {
+                const symbol_index = try self.addAtom(elf_file);
+                const sym = elf_file.symbol(symbol_index);
+                sym.flags.needs_zig_got = true;
+                metadata.symbol_index.* = symbol_index;
+            },
+            .pending_flush => return metadata.symbol_index.*,
+            .flushed => {},
+        }
+        metadata.state.* = .pending_flush;
+        break :symbol_index metadata.symbol_index.*;
     };
-    switch (metadata.state.*) {
-        .unused => {
-            const symbol_index = try self.addAtom(elf_file);
-            const sym = elf_file.symbol(symbol_index);
-            sym.flags.needs_zig_got = true;
-            metadata.symbol_index.* = symbol_index;
-        },
-        .pending_flush => return metadata.symbol_index.*,
-        .flushed => {},
-    }
-    metadata.state.* = .pending_flush;
-    const symbol_index = metadata.symbol_index.*;
     // anyerror needs to be deferred until flushModule
     if (lazy_sym.getDecl(mod) != .none) try self.updateLazySymbol(elf_file, pt, lazy_sym, symbol_index);
     return symbol_index;
@@ -820,6 +840,9 @@ pub fn getOrCreateMetadataForDecl(
     elf_file: *Elf,
     decl_index: InternPool.DeclIndex,
 ) !Symbol.Index {
+    elf_file.base.linker_mutex.lock();
+    defer elf_file.base.linker_mutex.unlock();
+
     const gpa = elf_file.base.comp.gpa;
     const gop = try self.decls.getOrPut(gpa, decl_index);
     if (!gop.found_existing) {
@@ -1072,9 +1095,16 @@ pub fn updateFunc(
     const decl_index = func.owner_decl;
     const decl = mod.declPtr(decl_index);
 
-    const sym_index = try self.getOrCreateMetadataForDecl(elf_file, decl_index);
-    self.freeUnnamedConsts(elf_file, decl_index);
-    elf_file.symbol(sym_index).atom(elf_file).?.freeRelocs(elf_file);
+    const sym_index = sym_index: {
+        const sym_index = try self.getOrCreateMetadataForDecl(elf_file, decl_index);
+
+        elf_file.base.linker_mutex.lock();
+        defer elf_file.base.linker_mutex.unlock();
+
+        self.freeUnnamedConsts(elf_file, decl_index);
+        elf_file.symbol(sym_index).atom(elf_file).?.freeRelocs(elf_file);
+        break :sym_index sym_index;
+    };
 
     var code_buffer = std.ArrayList(u8).init(gpa);
     defer code_buffer.deinit();
@@ -1097,10 +1127,17 @@ pub fn updateFunc(
         .ok => code_buffer.items,
         .fail => |em| {
             func.setAnalysisState(&mod.intern_pool, .codegen_failure);
+
+            mod.comp.mutex.lock();
+            defer mod.comp.mutex.unlock();
+
             try mod.failed_analysis.put(mod.gpa, AnalUnit.wrap(.{ .decl = decl_index }), em);
             return;
         },
     };
+
+    elf_file.base.linker_mutex.lock();
+    defer elf_file.base.linker_mutex.unlock();
 
     const shndx = try self.getDeclShdrIndex(elf_file, decl, sym_index, code);
     try self.updateDeclCode(elf_file, pt, decl_index, sym_index, shndx, code, elf.STT_FUNC);
@@ -1140,13 +1177,24 @@ pub fn updateDecl(
         const variable = decl.getOwnedVariable(mod).?;
         const name = decl.name.toSlice(&mod.intern_pool);
         const lib_name = variable.lib_name.toSlice(&mod.intern_pool);
+
+        elf_file.base.linker_mutex.lock();
+        defer elf_file.base.linker_mutex.unlock();
+
         const esym_index = try self.getGlobalSymbol(elf_file, name, lib_name);
         elf_file.symbol(self.symbol(esym_index)).flags.needs_got = true;
         return;
     }
 
-    const sym_index = try self.getOrCreateMetadataForDecl(elf_file, decl_index);
-    elf_file.symbol(sym_index).atom(elf_file).?.freeRelocs(elf_file);
+    const sym_index = sym_index: {
+        const sym_index = try self.getOrCreateMetadataForDecl(elf_file, decl_index);
+
+        elf_file.base.linker_mutex.lock();
+        defer elf_file.base.linker_mutex.unlock();
+
+        elf_file.symbol(sym_index).atom(elf_file).?.freeRelocs(elf_file);
+        break :sym_index sym_index;
+    };
 
     const gpa = elf_file.base.comp.gpa;
     var code_buffer = std.ArrayList(u8).init(gpa);
@@ -1157,25 +1205,31 @@ pub fn updateDecl(
 
     // TODO implement .debug_info for global variables
     const decl_val = if (decl.val.getVariable(mod)) |variable| Value.fromInterned(variable.init) else decl.val;
-    const res = if (decl_state) |*ds|
-        try codegen.generateSymbol(&elf_file.base, pt, decl.navSrcLoc(mod), decl_val, &code_buffer, .{
-            .dwarf = ds,
-        }, .{
-            .parent_atom_index = sym_index,
-        })
-    else
-        try codegen.generateSymbol(&elf_file.base, pt, decl.navSrcLoc(mod), decl_val, &code_buffer, .none, .{
-            .parent_atom_index = sym_index,
-        });
+    const res = try codegen.generateSymbol(
+        &elf_file.base,
+        pt,
+        decl.navSrcLoc(mod),
+        decl_val,
+        &code_buffer,
+        if (decl_state) |*ds| .{ .dwarf = ds } else .none,
+        .{ .parent_atom_index = sym_index },
+    );
 
     const code = switch (res) {
         .ok => code_buffer.items,
         .fail => |em| {
             decl.analysis = .codegen_failure;
+
+            mod.comp.mutex.lock();
+            defer mod.comp.mutex.unlock();
+
             try mod.failed_analysis.put(mod.gpa, AnalUnit.wrap(.{ .decl = decl_index }), em);
             return;
         },
     };
+
+    elf_file.base.linker_mutex.lock();
+    defer elf_file.base.linker_mutex.unlock();
 
     const shndx = try self.getDeclShdrIndex(elf_file, decl, sym_index, code);
     if (elf_file.shdrs.items[shndx].sh_flags & elf.SHF_TLS != 0)
@@ -1283,13 +1337,16 @@ pub fn lowerUnnamedConst(
 ) !u32 {
     const gpa = elf_file.base.comp.gpa;
     const mod = elf_file.base.comp.module.?;
-    const gop = try self.unnamed_consts.getOrPut(gpa, decl_index);
-    if (!gop.found_existing) {
-        gop.value_ptr.* = .{};
-    }
-    const unnamed_consts = gop.value_ptr;
-    const decl = mod.declPtr(decl_index);
-    const index = unnamed_consts.items.len;
+    const decl, const index = decl_index: {
+        elf_file.base.linker_mutex.lock();
+        defer elf_file.base.linker_mutex.unlock();
+
+        const gop = try self.unnamed_consts.getOrPut(gpa, decl_index);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{};
+        }
+        break :decl_index .{ mod.declPtr(decl_index), gop.value_ptr.items.len };
+    };
     const name = try std.fmt.allocPrint(gpa, "__unnamed_{}_{d}", .{ decl.fqn.fmt(&mod.intern_pool), index });
     defer gpa.free(name);
     const ty = val.typeOf(mod);
@@ -1310,8 +1367,12 @@ pub fn lowerUnnamedConst(
             return error.CodegenFail;
         },
     };
+
+    elf_file.base.linker_mutex.lock();
+    defer elf_file.base.linker_mutex.unlock();
+
     const sym = elf_file.symbol(sym_index);
-    try unnamed_consts.append(gpa, sym.atom_index);
+    try self.unnamed_consts.getPtr(decl_index).?.append(gpa, sym.atom_index);
     return sym_index;
 }
 
@@ -1335,7 +1396,12 @@ fn lowerConst(
     var code_buffer = std.ArrayList(u8).init(gpa);
     defer code_buffer.deinit();
 
-    const sym_index = try self.addAtom(elf_file);
+    const sym_index = sym_index: {
+        elf_file.base.linker_mutex.lock();
+        defer elf_file.base.linker_mutex.unlock();
+
+        break :sym_index try self.addAtom(elf_file);
+    };
 
     const res = try codegen.generateSymbol(
         &elf_file.base,
@@ -1343,13 +1409,16 @@ fn lowerConst(
         src_loc,
         val,
         &code_buffer,
-        .{ .none = {} },
+        .none,
         .{ .parent_atom_index = sym_index },
     );
     const code = switch (res) {
         .ok => code_buffer.items,
         .fail => |em| return .{ .fail = em },
     };
+
+    elf_file.base.linker_mutex.lock();
+    defer elf_file.base.linker_mutex.unlock();
 
     const local_sym = elf_file.symbol(sym_index);
     const name_str_index = try self.strtab.insert(gpa, name);
@@ -1529,7 +1598,7 @@ pub fn getGlobalSymbol(self: *ZigObject, elf_file: *Elf, name: []const u8, lib_n
     return lookup_gop.value_ptr.*;
 }
 
-pub fn getString(self: ZigObject, off: u32) [:0]const u8 {
+pub fn getString(self: *const ZigObject, off: u32) [:0]const u8 {
     return self.strtab.getAssumeExists(off);
 }
 

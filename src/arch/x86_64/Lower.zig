@@ -348,6 +348,8 @@ fn emit(lower: *Lower, prefix: Prefix, mnemonic: Mnemonic, ops: []const Operand)
                     assert(mem_op.sib.disp == 0);
                     assert(mem_op.sib.scale_index.scale == 0);
 
+                    lower.bin_file.linker_mutex.lock();
+                    defer lower.bin_file.linker_mutex.unlock();
                     if (lower.bin_file.cast(link.File.Elf)) |elf_file| {
                         const sym_index = elf_file.zigObjectPtr().?.symbol(sym.sym_index);
                         const elf_sym = elf_file.symbol(sym_index);

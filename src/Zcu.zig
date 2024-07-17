@@ -3200,11 +3200,14 @@ pub const Feature = enum {
     safety_checked_instructions,
     /// If the backend supports running from another thread.
     separate_thread,
+    /// If the backend supports running across multiple threads.
+    multiple_threads,
 };
 
 pub fn backendSupportsFeature(zcu: *const Zcu, comptime feature: Feature) bool {
-    const backend = target_util.zigBackend(zcu.root_mod.resolved_target.result, zcu.comp.config.use_llvm);
-    return target_util.backendSupportsFeature(backend, feature);
+    const target = zcu.root_mod.resolved_target.result;
+    const backend = target_util.zigBackend(target, zcu.comp.config.use_llvm);
+    return target_util.backendSupportsFeature(target, backend, feature);
 }
 
 pub const AtomicPtrAlignmentError = error{

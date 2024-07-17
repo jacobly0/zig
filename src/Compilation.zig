@@ -3982,6 +3982,12 @@ fn queueCodegenJob(comp: *Compilation, tid: usize, codegen_job: CodegenJob) !voi
         !comp.module.?.backendSupportsFeature(.separate_thread))
         return processOneCodegenJob(tid, comp, codegen_job);
 
+    if (comp.module.?.backendSupportsFeature(.multiple_threads)) return comp.thread_pool.spawnWgId(
+        &comp.work_queue_wait_group,
+        processOneCodegenJob,
+        .{ comp, codegen_job },
+    );
+
     {
         comp.codegen_work.mutex.lock();
         defer comp.codegen_work.mutex.unlock();
@@ -3999,10 +4005,7 @@ fn codegenThread(tid: usize, comp: *Compilation) void {
             comp.codegen_work.mutex.unlock();
             defer comp.codegen_work.mutex.lock();
 
-            processOneCodegenJob(tid, comp, codegen_job) catch |job_error| {
-                comp.codegen_work.job_error = job_error;
-                break;
-            };
+            processOneCodegenJob(tid, comp, codegen_job);
             continue;
         }
 
@@ -4012,20 +4015,27 @@ fn codegenThread(tid: usize, comp: *Compilation) void {
     }
 }
 
-fn processOneCodegenJob(tid: usize, comp: *Compilation, codegen_job: CodegenJob) JobError!void {
+fn processOneCodegenJob(tid: usize, comp: *Compilation, codegen_job: CodegenJob) void {
+    const pt: Zcu.PerThread = .{ .zcu = comp.module.?, .tid = @enumFromInt(tid) };
+    processOneCodegenJobInner(pt, codegen_job) catch |job_error| {
+        comp.codegen_work.mutex.lock();
+        defer comp.codegen_work.mutex.unlock();
+        comp.codegen_work.job_error = job_error;
+    };
+}
+
+fn processOneCodegenJobInner(pt: Zcu.PerThread, codegen_job: CodegenJob) JobError!void {
     switch (codegen_job) {
         .decl => |decl_index| {
             const named_frame = tracy.namedFrame("codegen_decl");
             defer named_frame.end();
 
-            const pt: Zcu.PerThread = .{ .zcu = comp.module.?, .tid = @enumFromInt(tid) };
             try pt.linkerUpdateDecl(decl_index);
         },
         .func => |func| {
             const named_frame = tracy.namedFrame("codegen_func");
             defer named_frame.end();
 
-            const pt: Zcu.PerThread = .{ .zcu = comp.module.?, .tid = @enumFromInt(tid) };
             // This call takes ownership of `func.air`.
             try pt.linkerUpdateFunc(func.func, func.air);
         },

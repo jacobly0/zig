@@ -535,7 +535,7 @@ pub fn zigBackend(target: std.Target, use_llvm: bool) std.builtin.CompilerBacken
     };
 }
 
-pub inline fn backendSupportsFeature(backend: std.builtin.CompilerBackend, comptime feature: Feature) bool {
+pub inline fn backendSupportsFeature(target: std.Target, backend: std.builtin.CompilerBackend, comptime feature: Feature) bool {
     return switch (feature) {
         .panic_fn => switch (backend) {
             .stage2_c, .stage2_llvm, .stage2_x86_64, .stage2_riscv64 => true,
@@ -572,6 +572,10 @@ pub inline fn backendSupportsFeature(backend: std.builtin.CompilerBackend, compt
         .separate_thread => switch (backend) {
             .stage2_llvm => false,
             else => true,
+        },
+        .multiple_threads => switch (backend) {
+            .stage2_x86_64 => target.ofmt == .elf,
+            else => false,
         },
     };
 }

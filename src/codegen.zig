@@ -903,6 +903,8 @@ fn genDeclRef(
     const is_threadlocal = val.isPtrToThreadLocal(zcu) and !single_threaded;
     const is_extern = decl.isExtern(zcu);
 
+    lf.linker_mutex.lock();
+    defer lf.linker_mutex.unlock();
     if (lf.cast(link.File.Elf)) |elf_file| {
         if (is_extern) {
             const name = decl.name.toSlice(ip);
@@ -967,6 +969,8 @@ fn genUnnamedConst(
     const local_sym_index = lf.lowerUnnamedConst(pt, val, owner_decl_index) catch |err| {
         return GenResult.fail(gpa, src_loc, "lowering unnamed constant failed: {s}", .{@errorName(err)});
     };
+    lf.linker_mutex.lock();
+    defer lf.linker_mutex.unlock();
     switch (lf.tag) {
         .elf => {
             const elf_file = lf.cast(link.File.Elf).?;

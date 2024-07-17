@@ -5042,7 +5042,7 @@ fn writeSectionSymbols(self: *Elf) void {
     }
 }
 
-pub fn sectionSymbolOutputSymtabIndex(self: Elf, shndx: u32) u32 {
+pub fn sectionSymbolOutputSymtabIndex(self: *const Elf, shndx: u32) u32 {
     if (self.eh_frame_section_index) |index| {
         if (index == shndx) return @intCast(self.output_sections.keys().len + 1);
     }
@@ -5054,7 +5054,7 @@ pub fn sectionSymbolOutputSymtabIndex(self: Elf, shndx: u32) u32 {
 }
 
 /// Always 4 or 8 depending on whether this is 32-bit ELF or 64-bit ELF.
-pub fn ptrWidthBytes(self: Elf) u8 {
+pub fn ptrWidthBytes(self: *const Elf) u8 {
     return switch (self.ptr_width) {
         .p32 => 4,
         .p64 => 8,
@@ -5063,7 +5063,7 @@ pub fn ptrWidthBytes(self: Elf) u8 {
 
 /// Does not necessarily match `ptrWidthBytes` for example can be 2 bytes
 /// in a 32-bit ELF file.
-pub fn archPtrWidthBytes(self: Elf) u8 {
+pub fn archPtrWidthBytes(self: *const Elf) u8 {
     const target = self.base.comp.root_mod.resolved_target.result;
     return @intCast(@divExact(target.ptrBitWidth(), 8));
 }
@@ -5348,7 +5348,7 @@ const CsuObjects = struct {
 
 /// If a target compiles other output modes as dynamic libraries,
 /// this function returns true for those too.
-pub fn isEffectivelyDynLib(self: Elf) bool {
+pub fn isEffectivelyDynLib(self: *const Elf) bool {
     if (self.base.isDynLib()) return true;
     return switch (self.getTarget().os.tag) {
         .haiku => self.base.isExe(),
@@ -5356,7 +5356,7 @@ pub fn isEffectivelyDynLib(self: Elf) bool {
     };
 }
 
-pub fn isZigSection(self: Elf, shndx: u32) bool {
+pub fn isZigSection(self: *const Elf, shndx: u32) bool {
     inline for (&[_]?u32{
         self.zig_text_section_index,
         self.zig_data_rel_ro_section_index,
@@ -5371,7 +5371,7 @@ pub fn isZigSection(self: Elf, shndx: u32) bool {
     return false;
 }
 
-pub fn isDebugSection(self: Elf, shndx: u32) bool {
+pub fn isDebugSection(self: *const Elf, shndx: u32) bool {
     inline for (&[_]?u32{
         self.debug_info_section_index,
         self.debug_abbrev_section_index,
@@ -5630,7 +5630,7 @@ pub fn addFileHandle(self: *Elf, handle: fs.File) !File.HandleIndex {
     return index;
 }
 
-pub fn fileHandle(self: Elf, index: File.HandleIndex) File.Handle {
+pub fn fileHandle(self: *const Elf, index: File.HandleIndex) File.Handle {
     assert(index < self.file_handles.items.len);
     return self.file_handles.items[index];
 }
@@ -5913,7 +5913,7 @@ fn addErrorWithNotesAssumeCapacity(self: *Elf, note_count: usize) error{OutOfMem
     return .{ .index = index };
 }
 
-pub fn getShString(self: Elf, off: u32) [:0]const u8 {
+pub fn getShString(self: *const Elf, off: u32) [:0]const u8 {
     assert(off < self.shstrtab.items.len);
     return mem.sliceTo(@as([*:0]const u8, @ptrCast(self.shstrtab.items.ptr + off)), 0);
 }
@@ -5926,7 +5926,7 @@ pub fn insertShString(self: *Elf, name: [:0]const u8) error{OutOfMemory}!u32 {
     return off;
 }
 
-pub fn getDynString(self: Elf, off: u32) [:0]const u8 {
+pub fn getDynString(self: *const Elf, off: u32) [:0]const u8 {
     assert(off < self.dynstrtab.items.len);
     return mem.sliceTo(@as([*:0]const u8, @ptrCast(self.dynstrtab.items.ptr + off)), 0);
 }
@@ -6297,11 +6297,11 @@ pub fn lsearch(comptime T: type, haystack: []align(1) const T, predicate: anytyp
     return i;
 }
 
-pub fn getTarget(self: Elf) std.Target {
+pub fn getTarget(self: *const Elf) std.Target {
     return self.base.comp.root_mod.resolved_target.result;
 }
 
-fn requiresThunks(self: Elf) bool {
+fn requiresThunks(self: *const Elf) bool {
     return switch (self.getTarget().cpu.arch) {
         .aarch64 => true,
         .x86_64, .riscv64 => false,

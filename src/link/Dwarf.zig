@@ -556,6 +556,9 @@ pub const DeclState = struct {
         owner_decl: InternPool.DeclIndex,
         loc: DbgInfoLoc,
     ) error{OutOfMemory}!void {
+        self.dwarf.bin_file.linker_mutex.lock();
+        defer self.dwarf.bin_file.linker_mutex.unlock();
+
         const pt = self.pt;
         const dbg_info = &self.dbg_info;
         const atom_index = self.di_atom_decls.get(owner_decl).?;
@@ -672,6 +675,9 @@ pub const DeclState = struct {
         is_ptr: bool,
         loc: DbgInfoLoc,
     ) error{OutOfMemory}!void {
+        self.dwarf.bin_file.linker_mutex.lock();
+        defer self.dwarf.bin_file.linker_mutex.unlock();
+
         const dbg_info = &self.dbg_info;
         const atom_index = self.di_atom_decls.get(owner_decl).?;
         const name_with_null = name.ptr[0 .. name.len + 1];
@@ -1080,6 +1086,9 @@ pub fn deinit(self: *Dwarf) void {
 pub fn initDeclState(self: *Dwarf, pt: Zcu.PerThread, decl_index: InternPool.DeclIndex) !DeclState {
     const tracy = trace(@src());
     defer tracy.end();
+
+    self.bin_file.linker_mutex.lock();
+    defer self.bin_file.linker_mutex.unlock();
 
     const decl = pt.zcu.declPtr(decl_index);
     log.debug("initDeclState {}{*}", .{ decl.fqn.fmt(&pt.zcu.intern_pool), decl });
@@ -1696,6 +1705,9 @@ fn writeDeclDebugInfo(self: *Dwarf, atom_index: Atom.Index, dbg_info_buf: []cons
 pub fn updateDeclLineNumber(self: *Dwarf, zcu: *Zcu, decl_index: InternPool.DeclIndex) !void {
     const tracy = trace(@src());
     defer tracy.end();
+
+    self.bin_file.linker_mutex.lock();
+    defer self.bin_file.linker_mutex.unlock();
 
     const atom_index = try self.getOrCreateAtomForDecl(.src_fn, decl_index);
     const atom = self.getAtom(.src_fn, atom_index);

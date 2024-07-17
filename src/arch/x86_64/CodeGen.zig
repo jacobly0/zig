@@ -12326,6 +12326,8 @@ fn genCall(self: *Self, info: union(enum) {
                 } else func_key,
             }) {
                 .func => |func| {
+                    self.bin_file.linker_mutex.lock();
+                    defer self.bin_file.linker_mutex.unlock();
                     if (self.bin_file.cast(link.File.Elf)) |elf_file| {
                         const sym_index = try elf_file.zigObjectPtr().?.getOrCreateMetadataForDecl(elf_file, func.owner_decl);
                         const sym = elf_file.symbol(sym_index);
@@ -15272,6 +15274,9 @@ fn genExternSymbolRef(
     lib: ?[]const u8,
     callee: []const u8,
 ) InnerError!void {
+    self.bin_file.linker_mutex.lock();
+    defer self.bin_file.linker_mutex.unlock();
+
     const atom_index = try self.owner.getSymbolIndex(self);
     if (self.bin_file.cast(link.File.Elf)) |elf_file| {
         _ = try self.addInst(.{
@@ -15318,6 +15323,9 @@ fn genLazySymbolRef(
     reg: Register,
     lazy_sym: link.File.LazySymbol,
 ) InnerError!void {
+    self.bin_file.linker_mutex.lock();
+    defer self.bin_file.linker_mutex.unlock();
+
     const pt = self.pt;
     if (self.bin_file.cast(link.File.Elf)) |elf_file| {
         const sym_index = elf_file.zigObjectPtr().?.getOrCreateMetadataForLazySymbol(elf_file, pt, lazy_sym) catch |err|

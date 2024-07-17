@@ -75,6 +75,9 @@ pub const File = struct {
     lock: ?Cache.Lock = null,
     child_pid: ?std.process.Child.Id = null,
 
+    /// The almighty mutex.
+    linker_mutex: std.Thread.Mutex.Recursive = std.Thread.Mutex.Recursive.init,
+
     pub const OpenOptions = struct {
         symbol_count_hint: u64 = 32,
         program_code_size_hint: u64 = 256 * 1024,
@@ -937,36 +940,36 @@ pub const File = struct {
         }
     }
 
-    pub fn isStatic(self: File) bool {
+    pub fn isStatic(self: *const File) bool {
         return self.comp.config.link_mode == .static;
     }
 
-    pub fn isObject(self: File) bool {
+    pub fn isObject(self: *const File) bool {
         const output_mode = self.comp.config.output_mode;
         return output_mode == .Obj;
     }
 
-    pub fn isExe(self: File) bool {
+    pub fn isExe(self: *const File) bool {
         const output_mode = self.comp.config.output_mode;
         return output_mode == .Exe;
     }
 
-    pub fn isStaticLib(self: File) bool {
+    pub fn isStaticLib(self: *const File) bool {
         const output_mode = self.comp.config.output_mode;
         return output_mode == .Lib and self.isStatic();
     }
 
-    pub fn isRelocatable(self: File) bool {
+    pub fn isRelocatable(self: *const File) bool {
         return self.isObject() or self.isStaticLib();
     }
 
-    pub fn isDynLib(self: File) bool {
+    pub fn isDynLib(self: *const File) bool {
         const output_mode = self.comp.config.output_mode;
         return output_mode == .Lib and !self.isStatic();
     }
 
     pub fn emitLlvmObject(
-        base: File,
+        base: *const File,
         arena: Allocator,
         llvm_object: LlvmObject.Ptr,
         prog_node: std.Progress.Node,
