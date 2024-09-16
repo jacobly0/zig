@@ -1,41 +1,26 @@
 const std = @import("std");
-const build_options = @import("build_options");
-const builtin = @import("builtin");
 const assert = std.debug.assert;
 const codegen = @import("../../codegen.zig");
-const leb128 = std.leb;
 const link = @import("../../link.zig");
 const log = std.log.scoped(.codegen);
 const tracking_log = std.log.scoped(.tracking);
 const verbose_tracking_log = std.log.scoped(.verbose_tracking);
 const wip_mir_log = std.log.scoped(.wip_mir);
-const math = std.math;
-const mem = std.mem;
-const trace = @import("../../tracy.zig").trace;
 
 const Air = @import("../../Air.zig");
-const Allocator = mem.Allocator;
-const CodeGenError = codegen.CodeGenError;
-const Compilation = @import("../../Compilation.zig");
-const ErrorMsg = Zcu.ErrorMsg;
-const Result = codegen.Result;
+const Allocator = std.mem.Allocator;
 const Emit = @import("Emit.zig");
 const Liveness = @import("../../Liveness.zig");
 const Lower = @import("Lower.zig");
 const Mir = @import("Mir.zig");
-const Package = @import("../../Package.zig");
 const Zcu = @import("../../Zcu.zig");
+const Module = @import("../../Package/Module.zig");
 const InternPool = @import("../../InternPool.zig");
-const Alignment = InternPool.Alignment;
-const Target = std.Target;
 const Type = @import("../../Type.zig");
 const Value = @import("../../Value.zig");
-const Instruction = @import("encoder.zig").Instruction;
 
 const abi = @import("abi.zig");
 const bits = @import("bits.zig");
-const errUnionErrorOffset = codegen.errUnionErrorOffset;
-const errUnionPayloadOffset = codegen.errUnionPayloadOffset;
 const encoder = @import("encoder.zig");
 
 const Condition = bits.Condition;
@@ -46,7 +31,7 @@ const RegisterManager = abi.RegisterManager;
 const RegisterLock = RegisterManager.RegisterLock;
 const FrameIndex = bits.FrameIndex;
 
-const InnerError = CodeGenError || error{OutOfRegisters};
+const InnerError = codegen.CodeGenError || error{OutOfRegisters};
 
 gpa: Allocator,
 pt: Zcu.PerThread,
@@ -57,8 +42,8 @@ debug_output: link.File.DebugInfoOutput,
 target: *const std.Target,
 owner: Owner,
 inline_func: InternPool.Index,
-mod: *Package.Module,
-err_msg: ?*ErrorMsg,
+mod: *Module,
+err_msg: ?*Zcu.ErrorMsg,
 arg_index: u32,
 args: []MCValue,
 va_info: union {
@@ -90,6 +75,7 @@ end_di_column: u32,
 /// which is a relative jump, based on the address following the reloc.
 exitlude_jump_relocs: std.ArrayListUnmanaged(Mir.Inst.Index) = .empty,
 
+reused_operands: std.StaticBitSet(Liveness.bpi - 1) = undefined,
 const_tracking: ConstTrackingMap = .{},
 inst_tracking: InstTrackingMap = .{},
 
@@ -109,13 +95,11 @@ loops: std.AutoHashMapUnmanaged(Air.Inst.Index, struct {
     /// The state to restore before branching.
     state: State,
     /// The branch target.
-    jmp_target: Mir.Inst.Index,
+    target: Mir.Inst.Index,
 }) = .{},
 
-/// Debug field, used to find bugs in the compiler.
-air_bookkeeping: @TypeOf(air_bookkeeping_init) = air_bookkeeping_init,
-
-const air_bookkeeping_init = if (std.debug.runtime_safety) @as(usize, 0) else {};
+next_temp_index: Temp.Index = @enumFromInt(0),
+temp_type: [Temp.Index.max]Type = undefined,
 
 const Owner = union(enum) {
     nav_index: InternPool.Nav.Index,
@@ -434,7 +418,7 @@ pub const MCValue = union(enum) {
             .reserved_frame,
             .lea_symbol,
             => unreachable,
-            .memory => |addr| if (math.cast(i32, @as(i64, @bitCast(addr)))) |small_addr| .{
+            .memory => |addr| if (std.math.cast(i32, @as(i64, @bitCast(addr)))) |small_addr| .{
                 .base = .{ .reg = .ds },
                 .mod = .{ .rm = .{
                     .size = size,
@@ -485,8 +469,8 @@ pub const MCValue = union(enum) {
             .register_overflow => |pl| try writer.print("{s}:{s}", .{
                 @tagName(pl.eflags), @tagName(pl.reg),
             }),
-            .load_symbol => |pl| try writer.print("[{} + 0x{x}]", .{ pl.sym_index, pl.off }),
-            .lea_symbol => |pl| try writer.print("{} + 0x{x}", .{ pl.sym_index, pl.off }),
+            .load_symbol => |pl| try writer.print("[sym:{} + 0x{x}]", .{ pl.sym_index, pl.off }),
+            .lea_symbol => |pl| try writer.print("sym:{} + 0x{x}", .{ pl.sym_index, pl.off }),
             .indirect => |pl| try writer.print("[{s} + 0x{x}]", .{ @tagName(pl.reg), pl.off }),
             .load_direct => |pl| try writer.print("[direct:{d}]", .{pl}),
             .lea_direct => |pl| try writer.print("direct:{d}", .{pl}),
@@ -563,7 +547,7 @@ const InstTracking = struct {
             .reserved_frame => |index| self.long = .{ .load_frame = .{ .index = index } },
             else => unreachable,
         }
-        tracking_log.debug("spill %{d} from {} to {}", .{ inst, self.short, self.long });
+        tracking_log.debug("spill {} from {} to {}", .{ inst, self.short, self.long });
         try function.genCopy(function.typeOfIndex(inst), self.long, self.short, .{});
     }
 
@@ -606,7 +590,7 @@ const InstTracking = struct {
     fn trackSpill(self: *InstTracking, function: *Self, inst: Air.Inst.Index) !void {
         try function.freeValue(self.short);
         self.reuseFrame();
-        tracking_log.debug("%{d} => {} (spilled)", .{ inst, self.* });
+        tracking_log.debug("{} => {} (spilled)", .{ inst, self.* });
     }
 
     fn verifyMaterialize(self: InstTracking, target: InstTracking) void {
@@ -679,14 +663,14 @@ const InstTracking = struct {
             else => target.long,
         } else target.long;
         self.short = target.short;
-        tracking_log.debug("%{d} => {} (materialize)", .{ inst, self.* });
+        tracking_log.debug("{} => {} (materialize)", .{ inst, self.* });
     }
 
     fn resurrect(self: *InstTracking, inst: Air.Inst.Index, scope_generation: u32) void {
         switch (self.short) {
             .dead => |die_generation| if (die_generation >= scope_generation) {
                 self.reuseFrame();
-                tracking_log.debug("%{d} => {} (resurrect)", .{ inst, self.* });
+                tracking_log.debug("{} => {} (resurrect)", .{ inst, self.* });
             },
             else => {},
         }
@@ -696,7 +680,7 @@ const InstTracking = struct {
         if (self.short == .dead) return;
         try function.freeValue(self.short);
         self.short = .{ .dead = function.scope_generation };
-        tracking_log.debug("%{d} => {} (death)", .{ inst, self.* });
+        tracking_log.debug("{} => {} (death)", .{ inst, self.* });
     }
 
     fn reuse(
@@ -706,16 +690,13 @@ const InstTracking = struct {
         old_inst: Air.Inst.Index,
     ) void {
         self.short = .{ .dead = function.scope_generation };
-        if (new_inst) |inst|
-            tracking_log.debug("%{d} => {} (reuse %{d})", .{ inst, self.*, old_inst })
-        else
-            tracking_log.debug("tmp => {} (reuse %{d})", .{ self.*, old_inst });
+        tracking_log.debug("{?} => {} (reuse {})", .{ new_inst, self.*, old_inst });
     }
 
     fn liveOut(self: *InstTracking, function: *Self, inst: Air.Inst.Index) void {
         for (self.getRegs()) |reg| {
             if (function.register_manager.isRegFree(reg)) {
-                tracking_log.debug("%{d} => {} (live-out)", .{ inst, self.* });
+                tracking_log.debug("{} => {} (live-out)", .{ inst, self.* });
                 continue;
             }
 
@@ -742,7 +723,7 @@ const InstTracking = struct {
             // Perform side-effects of freeValue manually.
             function.register_manager.freeReg(reg);
 
-            tracking_log.debug("%{d} => {} (live-out %{d})", .{ inst, self.*, tracked_inst });
+            tracking_log.debug("{} => {} (live-out {})", .{ inst, self.*, tracked_inst });
         }
     }
 
@@ -760,10 +741,10 @@ const InstTracking = struct {
 const FrameAlloc = struct {
     abi_size: u31,
     spill_pad: u3,
-    abi_align: Alignment,
+    abi_align: InternPool.Alignment,
     ref_count: u16,
 
-    fn init(alloc_abi: struct { size: u64, pad: u3 = 0, alignment: Alignment }) FrameAlloc {
+    fn init(alloc_abi: struct { size: u64, pad: u3 = 0, alignment: InternPool.Alignment }) FrameAlloc {
         return .{
             .abi_size = @intCast(alloc_abi.size),
             .spill_pad = alloc_abi.pad,
@@ -780,14 +761,14 @@ const FrameAlloc = struct {
     fn initSpill(ty: Type, zcu: *Zcu) FrameAlloc {
         const abi_size = ty.abiSize(zcu);
         const spill_size = if (abi_size < 8)
-            math.ceilPowerOfTwoAssert(u64, abi_size)
+            std.math.ceilPowerOfTwoAssert(u64, abi_size)
         else
             std.mem.alignForward(u64, abi_size, 8);
         return init(.{
             .size = spill_size,
             .pad = @intCast(spill_size - abi_size),
             .alignment = ty.abiAlignment(zcu).maxStrict(
-                Alignment.fromNonzeroByteUnits(@min(spill_size, 8)),
+                InternPool.Alignment.fromNonzeroByteUnits(@min(spill_size, 8)),
             ),
         });
     }
@@ -820,7 +801,7 @@ pub fn generate(
     liveness: Liveness,
     code: *std.ArrayList(u8),
     debug_output: link.File.DebugInfoOutput,
-) CodeGenError!Result {
+) codegen.CodeGenError!codegen.Result {
     const zcu = pt.zcu;
     const comp = zcu.comp;
     const gpa = zcu.gpa;
@@ -864,6 +845,11 @@ pub fn generate(
         function.mir_instructions.deinit(gpa);
         function.mir_extra.deinit(gpa);
     }
+    try function.inst_tracking.ensureTotalCapacity(gpa, Temp.Index.max);
+    for (0..Temp.Index.max) |temp_index| {
+        const temp: Temp.Index = @enumFromInt(temp_index);
+        function.inst_tracking.putAssumeCapacityNoClobber(temp.toIndex(), InstTracking.init(.none));
+    }
 
     wip_mir_log.debug("{}:", .{fmtNav(func.owner_nav, ip)});
 
@@ -883,9 +869,9 @@ pub fn generate(
     const fn_info = zcu.typeToFunc(fn_type).?;
     const cc = abi.resolveCallingConvention(fn_info.cc, function.target.*);
     var call_info = function.resolveCallingConventionValues(fn_info, &.{}, .args_frame) catch |err| switch (err) {
-        error.CodegenFail => return Result{ .fail = function.err_msg.? },
-        error.OutOfRegisters => return Result{
-            .fail = try ErrorMsg.create(
+        error.CodegenFail => return .{ .fail = function.err_msg.? },
+        error.OutOfRegisters => return .{
+            .fail = try Zcu.ErrorMsg.create(
                 gpa,
                 src_loc,
                 "CodeGen ran out of registers. This is a bug in the Zig compiler.",
@@ -904,9 +890,9 @@ pub fn generate(
     }));
     function.frame_allocs.set(@intFromEnum(FrameIndex.base_ptr), FrameAlloc.init(.{
         .size = Type.usize.abiSize(zcu),
-        .alignment = Alignment.min(
+        .alignment = InternPool.Alignment.min(
             call_info.stack_align,
-            Alignment.fromNonzeroByteUnits(function.target.stackAlignment()),
+            InternPool.Alignment.fromNonzeroByteUnits(function.target.stackAlignment()),
         ),
     }));
     function.frame_allocs.set(
@@ -928,9 +914,9 @@ pub fn generate(
     };
 
     function.gen() catch |err| switch (err) {
-        error.CodegenFail => return Result{ .fail = function.err_msg.? },
-        error.OutOfRegisters => return Result{
-            .fail = try ErrorMsg.create(gpa, src_loc, "CodeGen ran out of registers. This is a bug in the Zig compiler.", .{}),
+        error.CodegenFail => return .{ .fail = function.err_msg.? },
+        error.OutOfRegisters => return .{
+            .fail = try Zcu.ErrorMsg.create(gpa, src_loc, "CodeGen ran out of registers. This is a bug in the Zig compiler.", .{}),
         },
         else => |e| return e,
     };
@@ -955,9 +941,9 @@ pub fn generate(
             .pic = mod.pic,
         },
         .atom_index = function.owner.getSymbolIndex(&function) catch |err| switch (err) {
-            error.CodegenFail => return Result{ .fail = function.err_msg.? },
-            error.OutOfRegisters => return Result{
-                .fail = try ErrorMsg.create(gpa, src_loc, "CodeGen ran out of registers. This is a bug in the Zig compiler.", .{}),
+            error.CodegenFail => return .{ .fail = function.err_msg.? },
+            error.OutOfRegisters => return .{
+                .fail = try Zcu.ErrorMsg.create(gpa, src_loc, "CodeGen ran out of registers. This is a bug in the Zig compiler.", .{}),
             },
             else => |e| return e,
         },
@@ -969,14 +955,14 @@ pub fn generate(
     };
     defer emit.deinit();
     emit.emitMir() catch |err| switch (err) {
-        error.LowerFail, error.EmitFail => return Result{ .fail = emit.lower.err_msg.? },
+        error.LowerFail, error.EmitFail => return .{ .fail = emit.lower.err_msg.? },
         error.InvalidInstruction, error.CannotEncode => |e| {
             const msg = switch (e) {
                 error.InvalidInstruction => "CodeGen failed to find a viable instruction.",
                 error.CannotEncode => "CodeGen failed to encode the instruction.",
             };
-            return Result{
-                .fail = try ErrorMsg.create(
+            return .{
+                .fail = try Zcu.ErrorMsg.create(
                     gpa,
                     src_loc,
                     "{s} This is a bug in the Zig compiler.",
@@ -988,9 +974,9 @@ pub fn generate(
     };
 
     if (function.err_msg) |em| {
-        return Result{ .fail = em };
+        return .{ .fail = em };
     } else {
-        return Result.ok;
+        return .ok;
     }
 }
 
@@ -1001,7 +987,7 @@ pub fn generateLazy(
     lazy_sym: link.File.LazySymbol,
     code: *std.ArrayList(u8),
     debug_output: link.File.DebugInfoOutput,
-) CodeGenError!Result {
+) codegen.CodeGenError!codegen.Result {
     const comp = bin_file.comp;
     const gpa = comp.gpa;
     // This function is for generating global code, so we use the root module.
@@ -1033,9 +1019,9 @@ pub fn generateLazy(
     }
 
     function.genLazy(lazy_sym) catch |err| switch (err) {
-        error.CodegenFail => return Result{ .fail = function.err_msg.? },
-        error.OutOfRegisters => return Result{
-            .fail = try ErrorMsg.create(gpa, src_loc, "CodeGen ran out of registers. This is a bug in the Zig compiler.", .{}),
+        error.CodegenFail => return .{ .fail = function.err_msg.? },
+        error.OutOfRegisters => return .{
+            .fail = try Zcu.ErrorMsg.create(gpa, src_loc, "CodeGen ran out of registers. This is a bug in the Zig compiler.", .{}),
         },
         else => |e| return e,
     };
@@ -1060,9 +1046,9 @@ pub fn generateLazy(
             .pic = mod.pic,
         },
         .atom_index = function.owner.getSymbolIndex(&function) catch |err| switch (err) {
-            error.CodegenFail => return Result{ .fail = function.err_msg.? },
-            error.OutOfRegisters => return Result{
-                .fail = try ErrorMsg.create(gpa, src_loc, "CodeGen ran out of registers. This is a bug in the Zig compiler.", .{}),
+            error.CodegenFail => return .{ .fail = function.err_msg.? },
+            error.OutOfRegisters => return .{
+                .fail = try Zcu.ErrorMsg.create(gpa, src_loc, "CodeGen ran out of registers. This is a bug in the Zig compiler.", .{}),
             },
             else => |e| return e,
         },
@@ -1074,14 +1060,14 @@ pub fn generateLazy(
     };
     defer emit.deinit();
     emit.emitMir() catch |err| switch (err) {
-        error.LowerFail, error.EmitFail => return Result{ .fail = emit.lower.err_msg.? },
+        error.LowerFail, error.EmitFail => return .{ .fail = emit.lower.err_msg.? },
         error.InvalidInstruction, error.CannotEncode => |e| {
             const msg = switch (e) {
                 error.InvalidInstruction => "CodeGen failed to find a viable instruction.",
                 error.CannotEncode => "CodeGen failed to encode the instruction.",
             };
-            return Result{
-                .fail = try ErrorMsg.create(
+            return .{
+                .fail = try Zcu.ErrorMsg.create(
                     gpa,
                     src_loc,
                     "{s} This is a bug in the Zig compiler.",
@@ -1093,9 +1079,9 @@ pub fn generateLazy(
     };
 
     if (function.err_msg) |em| {
-        return Result{ .fail = em };
+        return .{ .fail = em };
     } else {
-        return Result.ok;
+        return .ok;
     }
 }
 
@@ -1220,14 +1206,14 @@ fn formatWipMir(
                 lower.mir.extraData(Mir.Imm64, mir_inst.data.ax.payload).data.decode(),
             }),
             .pseudo_dbg_local_as => {
-                const mem_op: Instruction.Operand = .{ .mem = .initSib(.qword, .{
+                const mem_op: encoder.Instruction.Operand = .{ .mem = .initSib(.qword, .{
                     .base = .{ .reloc = mir_inst.data.as.sym_index },
                 }) };
                 try writer.print(" {}, {}", .{ mir_inst.data.as.air_inst, mem_op.fmt(.m) });
             },
             .pseudo_dbg_local_aso => {
                 const sym_off = lower.mir.extraData(bits.SymbolOffset, mir_inst.data.ax.payload).data;
-                const mem_op: Instruction.Operand = .{ .mem = .initSib(.qword, .{
+                const mem_op: encoder.Instruction.Operand = .{ .mem = .initSib(.qword, .{
                     .base = .{ .reloc = sym_off.sym_index },
                     .disp = sym_off.off,
                 }) };
@@ -1235,7 +1221,7 @@ fn formatWipMir(
             },
             .pseudo_dbg_local_aro => {
                 const air_off = lower.mir.extraData(Mir.AirOffset, mir_inst.data.rx.payload).data;
-                const mem_op: Instruction.Operand = .{ .mem = .initSib(.qword, .{
+                const mem_op: encoder.Instruction.Operand = .{ .mem = .initSib(.qword, .{
                     .base = .{ .reg = mir_inst.data.rx.r1 },
                     .disp = air_off.off,
                 }) };
@@ -1243,14 +1229,14 @@ fn formatWipMir(
             },
             .pseudo_dbg_local_af => {
                 const frame_addr = lower.mir.extraData(bits.FrameAddr, mir_inst.data.ax.payload).data;
-                const mem_op: Instruction.Operand = .{ .mem = .initSib(.qword, .{
+                const mem_op: encoder.Instruction.Operand = .{ .mem = .initSib(.qword, .{
                     .base = .{ .frame = frame_addr.index },
                     .disp = frame_addr.off,
                 }) };
-                try writer.print(" {}, {d}", .{ mir_inst.data.ax.air_inst, mem_op.fmt(.m) });
+                try writer.print(" {}, {}", .{ mir_inst.data.ax.air_inst, mem_op.fmt(.m) });
             },
             .pseudo_dbg_local_am => {
-                const mem_op: Instruction.Operand = .{
+                const mem_op: encoder.Instruction.Operand = .{
                     .mem = lower.mir.extraData(Mir.Memory, mir_inst.data.ax.payload).data.decode(),
                 };
                 try writer.print(" {}, {}", .{ mir_inst.data.ax.air_inst, mem_op.fmt(.m) });
@@ -1272,7 +1258,7 @@ fn formatTracking(
     writer: anytype,
 ) @TypeOf(writer).Error!void {
     var it = data.self.inst_tracking.iterator();
-    while (it.next()) |entry| try writer.print("\n%{d} = {}", .{ entry.key_ptr.*, entry.value_ptr.* });
+    while (it.next()) |entry| try writer.print("\n{} = {}", .{ entry.key_ptr.*, entry.value_ptr.* });
 }
 fn fmtTracking(self: *Self) std.fmt.Formatter(formatTracking) {
     return .{ .data = .{ .self = self } };
@@ -1485,7 +1471,7 @@ fn asmAirImmediate(self: *Self, tag: MirTagAir, inst: Air.Inst.Index, imm: Immed
                 .i = @bitCast(s),
             } },
         }),
-        .unsigned => |u| _ = if (math.cast(u32, u)) |small| try self.addInst(.{
+        .unsigned => |u| _ = if (std.math.cast(u32, u)) |small| try self.addInst(.{
             .tag = .pseudo,
             .ops = switch (tag) {
                 .dbg_local => .pseudo_dbg_local_ai_u,
@@ -1690,7 +1676,7 @@ fn asmRegisterRegister(self: *Self, tag: Mir.Inst.FixedTag, reg1: Register, reg2
 fn asmRegisterImmediate(self: *Self, tag: Mir.Inst.FixedTag, reg: Register, imm: Immediate) !void {
     const ops: Mir.Inst.Ops, const i: u32 = switch (imm) {
         .signed => |s| .{ .ri_s, @bitCast(s) },
-        .unsigned => |u| if (math.cast(u32, u)) |small|
+        .unsigned => |u| if (std.math.cast(u32, u)) |small|
             .{ .ri_u, small }
         else
             .{ .ri_64, try self.addExtra(Mir.Imm64.encode(imm.unsigned)) },
@@ -1889,8 +1875,8 @@ fn asmRegisterMemoryImmediate(
     imm: Immediate,
 ) !void {
     if (switch (imm) {
-        .signed => |s| if (math.cast(i16, s)) |x| @as(u16, @bitCast(x)) else null,
-        .unsigned => |u| math.cast(u16, u),
+        .signed => |s| if (std.math.cast(i16, s)) |x| @as(u16, @bitCast(x)) else null,
+        .unsigned => |u| std.math.cast(u16, u),
         .reloc => unreachable,
     }) |small_imm| {
         _ = try self.addInst(.{
@@ -2117,11 +2103,11 @@ fn gen(self: *Self) InnerError!void {
         try self.asmOpOnly(.{ ._, .ret });
 
         const frame_layout = try self.computeFrameLayout(cc);
-        const need_frame_align = frame_layout.stack_mask != math.maxInt(u32);
+        const need_frame_align = frame_layout.stack_mask != std.math.maxInt(u32);
         const need_stack_adjust = frame_layout.stack_adjust > 0;
         const need_save_reg = frame_layout.save_reg_list.count() > 0;
         if (need_frame_align) {
-            const page_align = @as(u32, math.maxInt(u32)) << 12;
+            const page_align = @as(u32, std.math.maxInt(u32)) << 12;
             self.mir_instructions.set(backpatch_frame_align, .{
                 .tag = .@"and",
                 .ops = .ri_s,
@@ -2228,23 +2214,18 @@ fn gen(self: *Self) InnerError!void {
     });
 }
 
-fn checkInvariantsAfterAirInst(self: *Self, inst: Air.Inst.Index, old_air_bookkeeping: @TypeOf(air_bookkeeping_init)) void {
+fn checkInvariantsAfterAirInst(self: *Self) void {
     assert(!self.register_manager.lockedRegsExist());
 
     if (std.debug.runtime_safety) {
-        if (self.air_bookkeeping < old_air_bookkeeping + 1) {
-            std.debug.panic("in codegen.zig, handling of AIR instruction %{d} ('{}') did not do proper bookkeeping. Look for a missing call to finishAir.", .{ inst, self.air.instructions.items(.tag)[@intFromEnum(inst)] });
-        }
-
-        { // check consistency of tracked registers
-            var it = self.register_manager.free_registers.iterator(.{ .kind = .unset });
-            while (it.next()) |index| {
-                const tracked_inst = self.register_manager.registers[index];
-                const tracking = self.getResolvedInstValue(tracked_inst);
-                for (tracking.getRegs()) |reg| {
-                    if (RegisterManager.indexOfRegIntoTracked(reg).? == index) break;
-                } else unreachable; // tracked register not in use
-            }
+        // check consistency of tracked registers
+        var it = self.register_manager.free_registers.iterator(.{ .kind = .unset });
+        while (it.next()) |index| {
+            const tracked_inst = self.register_manager.registers[index];
+            const tracking = self.getResolvedInstValue(tracked_inst);
+            for (tracking.getRegs()) |reg| {
+                if (RegisterManager.indexOfRegIntoTracked(reg).? == index) break;
+            } else unreachable; // tracked register not in use
         }
     }
 }
@@ -2260,6 +2241,8 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
     const zcu = pt.zcu;
     const ip = &zcu.intern_pool;
     const air_tags = self.air.instructions.items(.tag);
+    const air_datas = self.air.instructions.items(.data);
+    const use_old = self.target.ofmt == .coff;
 
     self.arg_index = 0;
     for (body) |inst| switch (air_tags[@intFromEnum(inst)]) {
@@ -2267,12 +2250,13 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
             wip_mir_log.debug("{}", .{self.fmtAir(inst)});
             verbose_tracking_log.debug("{}", .{self.fmtTracking()});
 
-            const old_air_bookkeeping = self.air_bookkeeping;
+            self.reused_operands = @TypeOf(self.reused_operands).initEmpty();
             try self.inst_tracking.ensureUnusedCapacity(self.gpa, 1);
 
             try self.airArg(inst);
 
-            self.checkInvariantsAfterAirInst(inst, old_air_bookkeeping);
+            self.resetTemps();
+            self.checkInvariantsAfterAirInst();
         },
         else => break,
     };
@@ -2284,7 +2268,7 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
         wip_mir_log.debug("{}", .{self.fmtAir(inst)});
         verbose_tracking_log.debug("{}", .{self.fmtTracking()});
 
-        const old_air_bookkeeping = self.air_bookkeeping;
+        self.reused_operands = @TypeOf(self.reused_operands).initEmpty();
         try self.inst_tracking.ensureUnusedCapacity(self.gpa, 1);
         switch (air_tags[@intFromEnum(inst)]) {
             // zig fmt: off
@@ -2318,7 +2302,6 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
             .sub_sat         => try self.airSubSat(inst),
             .mul_sat         => try self.airMulSat(inst),
             .shl_sat         => try self.airShlSat(inst),
-            .slice           => try self.airSlice(inst),
 
             .sin,
             .cos,
@@ -2356,109 +2339,51 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
             .cmp_vector => try self.airCmpVector(inst),
             .cmp_lt_errors_len => try self.airCmpLtErrorsLen(inst),
 
-            .alloc           => try self.airAlloc(inst),
-            .ret_ptr         => try self.airRetPtr(inst),
-            .arg             => try self.airDbgArg(inst),
-            .assembly        => try self.airAsm(inst),
-            .bitcast         => try self.airBitCast(inst),
-            .block           => try self.airBlock(inst),
-            .br              => try self.airBr(inst),
-            .repeat          => try self.airRepeat(inst),
-            .switch_dispatch => try self.airSwitchDispatch(inst),
-            .trap            => try self.airTrap(),
-            .breakpoint      => try self.airBreakpoint(),
-            .ret_addr        => try self.airRetAddr(inst),
-            .frame_addr      => try self.airFrameAddress(inst),
-            .fence           => try self.airFence(inst),
-            .cond_br         => try self.airCondBr(inst),
-            .fptrunc         => try self.airFptrunc(inst),
-            .fpext           => try self.airFpext(inst),
-            .intcast         => try self.airIntCast(inst),
-            .trunc           => try self.airTrunc(inst),
-            .int_from_bool     => try self.airIntFromBool(inst),
-            .is_non_null     => try self.airIsNonNull(inst),
-            .is_non_null_ptr => try self.airIsNonNullPtr(inst),
-            .is_null         => try self.airIsNull(inst),
-            .is_null_ptr     => try self.airIsNullPtr(inst),
-            .is_non_err      => try self.airIsNonErr(inst),
-            .is_non_err_ptr  => try self.airIsNonErrPtr(inst),
-            .is_err          => try self.airIsErr(inst),
-            .is_err_ptr      => try self.airIsErrPtr(inst),
-            .load            => try self.airLoad(inst),
-            .loop            => try self.airLoop(inst),
-            .int_from_ptr        => try self.airIntFromPtr(inst),
-            .ret             => try self.airRet(inst, false),
-            .ret_safe        => try self.airRet(inst, true),
-            .ret_load        => try self.airRetLoad(inst),
-            .store           => try self.airStore(inst, false),
-            .store_safe      => try self.airStore(inst, true),
-            .struct_field_ptr=> try self.airStructFieldPtr(inst),
-            .struct_field_val=> try self.airStructFieldVal(inst),
-            .array_to_slice  => try self.airArrayToSlice(inst),
-            .float_from_int    => try self.airFloatFromInt(inst),
-            .int_from_float    => try self.airIntFromFloat(inst),
-            .cmpxchg_strong  => try self.airCmpxchg(inst),
-            .cmpxchg_weak    => try self.airCmpxchg(inst),
-            .atomic_rmw      => try self.airAtomicRmw(inst),
-            .atomic_load     => try self.airAtomicLoad(inst),
-            .memcpy          => try self.airMemcpy(inst),
-            .memset          => try self.airMemset(inst, false),
-            .memset_safe     => try self.airMemset(inst, true),
-            .set_union_tag   => try self.airSetUnionTag(inst),
-            .get_union_tag   => try self.airGetUnionTag(inst),
-            .clz             => try self.airClz(inst),
-            .ctz             => try self.airCtz(inst),
-            .popcount        => try self.airPopCount(inst),
-            .byte_swap       => try self.airByteSwap(inst),
-            .bit_reverse     => try self.airBitReverse(inst),
-            .tag_name        => try self.airTagName(inst),
-            .error_name      => try self.airErrorName(inst),
-            .splat           => try self.airSplat(inst),
-            .select          => try self.airSelect(inst),
-            .shuffle         => try self.airShuffle(inst),
-            .reduce          => try self.airReduce(inst),
-            .aggregate_init  => try self.airAggregateInit(inst),
-            .union_init      => try self.airUnionInit(inst),
-            .prefetch        => try self.airPrefetch(inst),
-            .mul_add         => try self.airMulAdd(inst),
-            .addrspace_cast  => return self.fail("TODO implement addrspace_cast", .{}),
-
-            .@"try"          => try self.airTry(inst),
-            .try_cold        => try self.airTry(inst), // TODO
-            .try_ptr         => try self.airTryPtr(inst),
-            .try_ptr_cold    => try self.airTryPtr(inst), // TODO
-
-            .dbg_stmt         => try self.airDbgStmt(inst),
-            .dbg_inline_block => try self.airDbgInlineBlock(inst),
-            .dbg_var_ptr,
-            .dbg_var_val,
-            .dbg_arg_inline,
-            => try self.airDbgVar(inst),
-
-            .call              => try self.airCall(inst, .auto),
-            .call_always_tail  => try self.airCall(inst, .always_tail),
-            .call_never_tail   => try self.airCall(inst, .never_tail),
-            .call_never_inline => try self.airCall(inst, .never_inline),
+            .bitcast          => try self.airBitCast(inst),
+            .fence            => try self.airFence(inst),
+            .fptrunc          => try self.airFptrunc(inst),
+            .fpext            => try self.airFpext(inst),
+            .intcast          => try self.airIntCast(inst),
+            .trunc            => try self.airTrunc(inst),
+            .is_non_null      => try self.airIsNonNull(inst),
+            .is_null          => try self.airIsNull(inst),
+            .is_non_err       => try self.airIsNonErr(inst),
+            .is_err           => try self.airIsErr(inst),
+            .load             => try self.airLoad(inst),
+            .store            => try self.airStore(inst, false),
+            .store_safe       => try self.airStore(inst, true),
+            .struct_field_val => try self.airStructFieldVal(inst),
+            .float_from_int   => try self.airFloatFromInt(inst),
+            .int_from_float   => try self.airIntFromFloat(inst),
+            .cmpxchg_strong   => try self.airCmpxchg(inst),
+            .cmpxchg_weak     => try self.airCmpxchg(inst),
+            .atomic_rmw       => try self.airAtomicRmw(inst),
+            .atomic_load      => try self.airAtomicLoad(inst),
+            .memcpy           => try self.airMemcpy(inst),
+            .memset           => try self.airMemset(inst, false),
+            .memset_safe      => try self.airMemset(inst, true),
+            .set_union_tag    => try self.airSetUnionTag(inst),
+            .get_union_tag    => try self.airGetUnionTag(inst),
+            .clz              => try self.airClz(inst),
+            .ctz              => try self.airCtz(inst),
+            .popcount         => try self.airPopCount(inst),
+            .byte_swap        => try self.airByteSwap(inst),
+            .bit_reverse      => try self.airBitReverse(inst),
+            .tag_name         => try self.airTagName(inst),
+            .error_name       => try self.airErrorName(inst),
+            .splat            => try self.airSplat(inst),
+            .select           => try self.airSelect(inst),
+            .shuffle          => try self.airShuffle(inst),
+            .reduce           => try self.airReduce(inst),
+            .aggregate_init   => try self.airAggregateInit(inst),
+            .union_init       => try self.airUnionInit(inst),
+            .prefetch         => try self.airPrefetch(inst),
+            .mul_add          => try self.airMulAdd(inst),
 
             .atomic_store_unordered => try self.airAtomicStore(inst, .unordered),
             .atomic_store_monotonic => try self.airAtomicStore(inst, .monotonic),
             .atomic_store_release   => try self.airAtomicStore(inst, .release),
             .atomic_store_seq_cst   => try self.airAtomicStore(inst, .seq_cst),
-
-            .struct_field_ptr_index_0 => try self.airStructFieldPtrIndex(inst, 0),
-            .struct_field_ptr_index_1 => try self.airStructFieldPtrIndex(inst, 1),
-            .struct_field_ptr_index_2 => try self.airStructFieldPtrIndex(inst, 2),
-            .struct_field_ptr_index_3 => try self.airStructFieldPtrIndex(inst, 3),
-
-            .field_parent_ptr => try self.airFieldParentPtr(inst),
-
-            .switch_br       => try self.airSwitchBr(inst),
-            .loop_switch_br  => try self.airLoopSwitchBr(inst),
-            .slice_ptr       => try self.airSlicePtr(inst),
-            .slice_len       => try self.airSliceLen(inst),
-
-            .ptr_slice_len_ptr => try self.airPtrSliceLenPtr(inst),
-            .ptr_slice_ptr_ptr => try self.airPtrSlicePtrPtr(inst),
 
             .array_elem_val      => try self.airArrayElemVal(inst),
             .slice_elem_val      => try self.airSliceElemVal(inst),
@@ -2466,17 +2391,9 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
             .ptr_elem_val        => try self.airPtrElemVal(inst),
             .ptr_elem_ptr        => try self.airPtrElemPtr(inst),
 
-            .inferred_alloc, .inferred_alloc_comptime => unreachable,
-            .unreach  => self.finishAirBookkeeping(),
-
             .optional_payload           => try self.airOptionalPayload(inst),
-            .optional_payload_ptr       => try self.airOptionalPayloadPtr(inst),
-            .optional_payload_ptr_set   => try self.airOptionalPayloadPtrSet(inst),
             .unwrap_errunion_err        => try self.airUnwrapErrUnionErr(inst),
             .unwrap_errunion_payload    => try self.airUnwrapErrUnionPayload(inst),
-            .unwrap_errunion_err_ptr    => try self.airUnwrapErrUnionErrPtr(inst),
-            .unwrap_errunion_payload_ptr=> try self.airUnwrapErrUnionPayloadPtr(inst),
-            .errunion_payload_ptr_set   => try self.airErrUnionPayloadPtrSet(inst),
             .err_return_trace           => try self.airErrReturnTrace(inst),
             .set_err_return_trace       => try self.airSetErrReturnTrace(inst),
             .save_err_return_trace_index=> try self.airSaveErrReturnTraceIndex(inst),
@@ -2484,7 +2401,12 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
             .wrap_optional         => try self.airWrapOptional(inst),
             .wrap_errunion_payload => try self.airWrapErrUnionPayload(inst),
             .wrap_errunion_err     => try self.airWrapErrUnionErr(inst),
+            // zig fmt: on
 
+            .add_safe,
+            .sub_safe,
+            .mul_safe,
+            => return self.fail("TODO implement safety_checked_instructions", .{}),
             .add_optimized,
             .sub_optimized,
             .mul_optimized,
@@ -2506,13 +2428,364 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
             .int_from_float_optimized,
             => return self.fail("TODO implement optimized float mode", .{}),
 
-            .add_safe,
-            .sub_safe,
-            .mul_safe,
-            => return self.fail("TODO implement safety_checked_instructions", .{}),
+            .arg => try self.airDbgArg(inst),
+            .alloc => if (use_old) try self.airAlloc(inst) else {
+                var slot = try self.tempFromValue(self.typeOfIndex(inst), .{ .lea_frame = .{
+                    .index = try self.allocMemPtr(inst),
+                } });
+                try slot.moveTo(inst, self);
+            },
+            .inferred_alloc => unreachable,
+            .inferred_alloc_comptime => unreachable,
+            .ret_ptr => if (use_old) try self.airRetPtr(inst) else {
+                var slot = switch (self.ret_mcv.long) {
+                    else => unreachable,
+                    .none => try self.tempFromValue(self.typeOfIndex(inst), .{ .lea_frame = .{
+                        .index = try self.allocMemPtr(inst),
+                    } }),
+                    .load_frame => slot: {
+                        var slot = try self.tempFromValue(self.typeOfIndex(inst), self.ret_mcv.long);
+                        try slot.toOffset(self.ret_mcv.short.indirect.off, self);
+                        break :slot slot;
+                    },
+                };
+                try slot.moveTo(inst, self);
+            },
+            .assembly => try self.airAsm(inst),
+            .block => if (use_old) try self.airBlock(inst) else {
+                const ty_pl = air_datas[@intFromEnum(inst)].ty_pl;
+                const extra = self.air.extraData(Air.Block, ty_pl.payload);
+                try self.asmPseudo(.pseudo_dbg_enter_block_none);
+                try self.lowerBlock(inst, @ptrCast(self.air.extra[extra.end..][0..extra.data.body_len]));
+                try self.asmPseudo(.pseudo_dbg_leave_block_none);
+            },
+            .loop => if (use_old) try self.airLoop(inst) else {
+                const ty_pl = air_datas[@intFromEnum(inst)].ty_pl;
+                const extra = self.air.extraData(Air.Block, ty_pl.payload);
+                self.scope_generation += 1;
+                try self.loops.putNoClobber(self.gpa, inst, .{
+                    .state = try self.saveState(),
+                    .target = @intCast(self.mir_instructions.len),
+                });
+                defer assert(self.loops.remove(inst));
+                try self.genBodyBlock(@ptrCast(self.air.extra[extra.end..][0..extra.data.body_len]));
+            },
+            .repeat => if (use_old) try self.airRepeat(inst) else {
+                const repeat = air_datas[@intFromEnum(inst)].repeat;
+                const loop = self.loops.get(repeat.loop_inst).?;
+                try self.restoreState(loop.state, &.{}, .{
+                    .emit_instructions = true,
+                    .update_tracking = false,
+                    .resurrect = false,
+                    .close_scope = true,
+                });
+                _ = try self.asmJmpReloc(loop.target);
+            },
+            .br => try self.airBr(inst),
+            .trap => try self.asmOpOnly(.{ ._, .ud2 }),
+            .breakpoint => try self.asmOpOnly(.{ ._, .int3 }),
+            .ret_addr => if (use_old) try self.airRetAddr(inst) else {
+                var slot = try self.tempFromValue(self.typeOfIndex(inst), .{ .load_frame = .{
+                    .index = .ret_addr,
+                } });
+                _ = try slot.toAnyReg(self);
+                try slot.moveTo(inst, self);
+            },
+            .frame_addr => if (use_old) try self.airFrameAddress(inst) else {
+                var slot = try self.tempFromValue(self.typeOfIndex(inst), .{ .lea_frame = .{
+                    .index = .base_ptr,
+                } });
+                try slot.moveTo(inst, self);
+            },
+            .call => try self.airCall(inst, .auto),
+            .call_always_tail => try self.airCall(inst, .always_tail),
+            .call_never_tail => try self.airCall(inst, .never_tail),
+            .call_never_inline => try self.airCall(inst, .never_inline),
+
+            .cond_br => try self.airCondBr(inst),
+            .switch_br => try self.airSwitchBr(inst),
+            .loop_switch_br => try self.airLoopSwitchBr(inst),
+            .switch_dispatch => try self.airSwitchDispatch(inst),
+            .@"try", .try_cold => try self.airTry(inst),
+            .try_ptr, .try_ptr_cold => try self.airTryPtr(inst),
+            .dbg_stmt => if (use_old) try self.airDbgStmt(inst) else {
+                const dbg_stmt = air_datas[@intFromEnum(inst)].dbg_stmt;
+                _ = try self.addInst(.{
+                    .tag = .pseudo,
+                    .ops = .pseudo_dbg_line_line_column,
+                    .data = .{ .line_column = .{
+                        .line = dbg_stmt.line,
+                        .column = dbg_stmt.column,
+                    } },
+                });
+            },
+            .dbg_inline_block => if (use_old) try self.airDbgInlineBlock(inst) else {
+                const ty_pl = air_datas[@intFromEnum(inst)].ty_pl;
+                const extra = self.air.extraData(Air.DbgInlineBlock, ty_pl.payload);
+                const old_inline_func = self.inline_func;
+                defer self.inline_func = old_inline_func;
+                self.inline_func = extra.data.func;
+                _ = try self.addInst(.{
+                    .tag = .pseudo,
+                    .ops = .pseudo_dbg_enter_inline_func,
+                    .data = .{ .func = extra.data.func },
+                });
+                try self.lowerBlock(inst, @ptrCast(self.air.extra[extra.end..][0..extra.data.body_len]));
+                _ = try self.addInst(.{
+                    .tag = .pseudo,
+                    .ops = .pseudo_dbg_leave_inline_func,
+                    .data = .{ .func = old_inline_func },
+                });
+            },
+            .dbg_var_ptr, .dbg_var_val, .dbg_arg_inline => if (use_old) try self.airDbgVar(inst) else {
+                const pl_op = air_datas[@intFromEnum(inst)].pl_op;
+                var ops = try self.tempsFromOperands(inst, .{pl_op.operand});
+                try self.genLocalDebugInfo(inst, ops[0].tracking(self).short);
+                try ops[0].die(self);
+            },
+            .is_null_ptr => if (use_old) try self.airIsNullPtr(inst) else {
+                const un_op = air_datas[@intFromEnum(inst)].un_op;
+                const opt_ty = self.typeOf(un_op).childType(zcu);
+                const opt_repr_is_pl = opt_ty.optionalReprIsPayload(zcu);
+                const opt_child_ty = opt_ty.optionalChild(zcu);
+                const opt_child_abi_size: u31 = @intCast(opt_child_ty.abiSize(zcu));
+                var ops = try self.tempsFromOperands(inst, .{un_op});
+                if (!opt_repr_is_pl) try ops[0].toOffset(opt_child_abi_size, self);
+                while (try ops[0].toLea(self)) {}
+                try self.asmMemoryImmediate(
+                    .{ ._, .cmp },
+                    try ops[0].tracking(self).short.deref().mem(self, if (!opt_repr_is_pl)
+                        .byte
+                    else if (opt_child_ty.isSlice(zcu))
+                        .qword
+                    else
+                        Memory.Size.fromSize(opt_child_abi_size)),
+                    Immediate.u(0),
+                );
+                var is_null = try self.tempFromValue(self.typeOfIndex(inst), .{ .eflags = .e });
+                try ops[0].die(self);
+                try is_null.moveTo(inst, self);
+            },
+            .is_non_null_ptr => if (use_old) try self.airIsNonNullPtr(inst) else {
+                const un_op = air_datas[@intFromEnum(inst)].un_op;
+                const opt_ty = self.typeOf(un_op).childType(zcu);
+                const opt_repr_is_pl = opt_ty.optionalReprIsPayload(zcu);
+                const opt_child_ty = opt_ty.optionalChild(zcu);
+                const opt_child_abi_size: u31 = @intCast(opt_child_ty.abiSize(zcu));
+                var ops = try self.tempsFromOperands(inst, .{un_op});
+                if (!opt_repr_is_pl) try ops[0].toOffset(opt_child_abi_size, self);
+                while (try ops[0].toLea(self)) {}
+                try self.asmMemoryImmediate(
+                    .{ ._, .cmp },
+                    try ops[0].tracking(self).short.deref().mem(self, if (!opt_repr_is_pl)
+                        .byte
+                    else if (opt_child_ty.isSlice(zcu))
+                        .qword
+                    else
+                        Memory.Size.fromSize(opt_child_abi_size)),
+                    Immediate.u(0),
+                );
+                var is_non_null = try self.tempFromValue(self.typeOfIndex(inst), .{ .eflags = .ne });
+                try ops[0].die(self);
+                try is_non_null.moveTo(inst, self);
+            },
+            .is_err_ptr => if (use_old) try self.airIsErrPtr(inst) else {
+                const un_op = air_datas[@intFromEnum(inst)].un_op;
+                const eu_ty = self.typeOf(un_op).childType(zcu);
+                const eu_err_ty = eu_ty.errorUnionSet(zcu);
+                const eu_pl_ty = eu_ty.errorUnionPayload(zcu);
+                const eu_err_off: i32 = @intCast(codegen.errUnionErrorOffset(eu_pl_ty, zcu));
+                var ops = try self.tempsFromOperands(inst, .{un_op});
+                try ops[0].toOffset(eu_err_off, self);
+                while (try ops[0].toLea(self)) {}
+                try self.asmMemoryImmediate(
+                    .{ ._, .cmp },
+                    try ops[0].tracking(self).short.deref().mem(self, self.memSize(eu_err_ty)),
+                    Immediate.u(0),
+                );
+                var is_err = try self.tempFromValue(self.typeOfIndex(inst), .{ .eflags = .ne });
+                try ops[0].die(self);
+                try is_err.moveTo(inst, self);
+            },
+            .is_non_err_ptr => if (use_old) try self.airIsNonErrPtr(inst) else {
+                const un_op = air_datas[@intFromEnum(inst)].un_op;
+                const eu_ty = self.typeOf(un_op).childType(zcu);
+                const eu_err_ty = eu_ty.errorUnionSet(zcu);
+                const eu_pl_ty = eu_ty.errorUnionPayload(zcu);
+                const eu_err_off: i32 = @intCast(codegen.errUnionErrorOffset(eu_pl_ty, zcu));
+                var ops = try self.tempsFromOperands(inst, .{un_op});
+                try ops[0].toOffset(eu_err_off, self);
+                while (try ops[0].toLea(self)) {}
+                try self.asmMemoryImmediate(
+                    .{ ._, .cmp },
+                    try ops[0].tracking(self).short.deref().mem(self, self.memSize(eu_err_ty)),
+                    Immediate.u(0),
+                );
+                var is_non_err = try self.tempFromValue(self.typeOfIndex(inst), .{ .eflags = .e });
+                try ops[0].die(self);
+                try is_non_err.moveTo(inst, self);
+            },
+            .int_from_ptr => if (use_old) try self.airIntFromPtr(inst) else {
+                const un_op = air_datas[@intFromEnum(inst)].un_op;
+                var ops = try self.tempsFromOperands(inst, .{un_op});
+                try ops[0].toLimb(0, self);
+                try ops[0].moveTo(inst, self);
+            },
+            .int_from_bool => if (use_old) try self.airIntFromBool(inst) else {
+                const un_op = air_datas[@intFromEnum(inst)].un_op;
+                var ops = try self.tempsFromOperands(inst, .{un_op});
+                try ops[0].moveTo(inst, self);
+            },
+            .ret => try self.airRet(inst, false),
+            .ret_safe => try self.airRet(inst, true),
+            .ret_load => try self.airRetLoad(inst),
+            .unreach => {},
+            .optional_payload_ptr => if (use_old) try self.airOptionalPayloadPtr(inst) else {
+                const ty_op = air_datas[@intFromEnum(inst)].ty_op;
+                var ops = try self.tempsFromOperands(inst, .{ty_op.operand});
+                try ops[0].moveTo(inst, self);
+            },
+            .optional_payload_ptr_set => if (use_old) try self.airOptionalPayloadPtrSet(inst) else {
+                const ty_op = air_datas[@intFromEnum(inst)].ty_op;
+                const opt_ty = self.typeOf(ty_op.operand).childType(zcu);
+                var ops = try self.tempsFromOperands(inst, .{ty_op.operand});
+                if (!opt_ty.optionalReprIsPayload(zcu)) {
+                    const opt_child_ty = opt_ty.optionalChild(zcu);
+                    const opt_child_abi_size: i32 = @intCast(opt_child_ty.abiSize(zcu));
+                    try ops[0].toOffset(opt_child_abi_size, self);
+                    var has_value = try self.tempFromValue(Type.bool, .{ .immediate = 1 });
+                    try ops[0].store(&has_value, self);
+                    try has_value.die(self);
+                    try ops[0].toOffset(-opt_child_abi_size, self);
+                }
+                try ops[0].moveTo(inst, self);
+            },
+            .unwrap_errunion_payload_ptr => if (use_old) try self.airUnwrapErrUnionPayloadPtr(inst) else {
+                const ty_op = air_datas[@intFromEnum(inst)].ty_op;
+                const eu_ty = self.typeOf(ty_op.operand).childType(zcu);
+                const eu_pl_ty = eu_ty.errorUnionPayload(zcu);
+                const eu_pl_off: i32 = @intCast(codegen.errUnionPayloadOffset(eu_pl_ty, zcu));
+                var ops = try self.tempsFromOperands(inst, .{ty_op.operand});
+                try ops[0].toOffset(eu_pl_off, self);
+                try ops[0].moveTo(inst, self);
+            },
+            .unwrap_errunion_err_ptr => if (use_old) try self.airUnwrapErrUnionErrPtr(inst) else {
+                const ty_op = air_datas[@intFromEnum(inst)].ty_op;
+                const eu_ty = self.typeOf(ty_op.operand).childType(zcu);
+                const eu_pl_ty = eu_ty.errorUnionPayload(zcu);
+                const eu_err_off: i32 = @intCast(codegen.errUnionErrorOffset(eu_pl_ty, zcu));
+                var ops = try self.tempsFromOperands(inst, .{ty_op.operand});
+                try ops[0].toOffset(eu_err_off, self);
+                var err = try ops[0].load(eu_ty.errorUnionSet(zcu), self);
+                try ops[0].die(self);
+                try err.moveTo(inst, self);
+            },
+            .errunion_payload_ptr_set => if (use_old) try self.airErrUnionPayloadPtrSet(inst) else {
+                const ty_op = air_datas[@intFromEnum(inst)].ty_op;
+                const eu_ty = self.typeOf(ty_op.operand).childType(zcu);
+                const eu_err_ty = eu_ty.errorUnionSet(zcu);
+                const eu_pl_ty = eu_ty.errorUnionPayload(zcu);
+                const eu_err_off: i32 = @intCast(codegen.errUnionErrorOffset(eu_pl_ty, zcu));
+                const eu_pl_off: i32 = @intCast(codegen.errUnionPayloadOffset(eu_pl_ty, zcu));
+                var ops = try self.tempsFromOperands(inst, .{ty_op.operand});
+                try ops[0].toOffset(eu_err_off, self);
+                var no_err = try self.tempFromValue(eu_err_ty, .{ .immediate = 0 });
+                try ops[0].store(&no_err, self);
+                try no_err.die(self);
+                try ops[0].toOffset(eu_pl_off - eu_err_off, self);
+                try ops[0].moveTo(inst, self);
+            },
+            .struct_field_ptr => if (use_old) try self.airStructFieldPtr(inst) else {
+                const ty_pl = air_datas[@intFromEnum(inst)].ty_pl;
+                const extra = self.air.extraData(Air.StructField, ty_pl.payload).data;
+                var ops = try self.tempsFromOperands(inst, .{extra.struct_operand});
+                try ops[0].toOffset(self.fieldOffset(self.typeOf(extra.struct_operand), self.typeOfIndex(inst), extra.field_index), self);
+                try ops[0].moveTo(inst, self);
+            },
+            .struct_field_ptr_index_0 => if (use_old) try self.airStructFieldPtrIndex(inst, 0) else {
+                const ty_op = air_datas[@intFromEnum(inst)].ty_op;
+                var ops = try self.tempsFromOperands(inst, .{ty_op.operand});
+                try ops[0].toOffset(self.fieldOffset(self.typeOf(ty_op.operand), self.typeOfIndex(inst), 0), self);
+                try ops[0].moveTo(inst, self);
+            },
+            .struct_field_ptr_index_1 => if (use_old) try self.airStructFieldPtrIndex(inst, 1) else {
+                const ty_op = air_datas[@intFromEnum(inst)].ty_op;
+                var ops = try self.tempsFromOperands(inst, .{ty_op.operand});
+                try ops[0].toOffset(self.fieldOffset(self.typeOf(ty_op.operand), self.typeOfIndex(inst), 1), self);
+                try ops[0].moveTo(inst, self);
+            },
+            .struct_field_ptr_index_2 => if (use_old) try self.airStructFieldPtrIndex(inst, 2) else {
+                const ty_op = air_datas[@intFromEnum(inst)].ty_op;
+                var ops = try self.tempsFromOperands(inst, .{ty_op.operand});
+                try ops[0].toOffset(self.fieldOffset(self.typeOf(ty_op.operand), self.typeOfIndex(inst), 2), self);
+                try ops[0].moveTo(inst, self);
+            },
+            .struct_field_ptr_index_3 => if (use_old) try self.airStructFieldPtrIndex(inst, 3) else {
+                const ty_op = air_datas[@intFromEnum(inst)].ty_op;
+                var ops = try self.tempsFromOperands(inst, .{ty_op.operand});
+                try ops[0].toOffset(self.fieldOffset(self.typeOf(ty_op.operand), self.typeOfIndex(inst), 3), self);
+                try ops[0].moveTo(inst, self);
+            },
+            .slice => if (use_old) try self.airSlice(inst) else {
+                const ty_pl = air_datas[@intFromEnum(inst)].ty_pl;
+                const bin_op = self.air.extraData(Air.Bin, ty_pl.payload).data;
+                var ops = try self.tempsFromOperands(inst, .{ bin_op.lhs, bin_op.rhs });
+                try ops[0].toPair(&ops[1], self);
+                try ops[0].moveTo(inst, self);
+            },
+            .slice_len => if (use_old) try self.airSliceLen(inst) else {
+                const ty_op = air_datas[@intFromEnum(inst)].ty_op;
+                var ops = try self.tempsFromOperands(inst, .{ty_op.operand});
+                try ops[0].toLimb(1, self);
+                try ops[0].moveTo(inst, self);
+            },
+            .slice_ptr => if (use_old) try self.airSlicePtr(inst) else {
+                const ty_op = air_datas[@intFromEnum(inst)].ty_op;
+                var ops = try self.tempsFromOperands(inst, .{ty_op.operand});
+                try ops[0].toLimb(0, self);
+                try ops[0].moveTo(inst, self);
+            },
+            .ptr_slice_len_ptr => if (use_old) try self.airPtrSliceLenPtr(inst) else {
+                const ty_op = air_datas[@intFromEnum(inst)].ty_op;
+                var ops = try self.tempsFromOperands(inst, .{ty_op.operand});
+                try ops[0].toOffset(8, self);
+                try ops[0].moveTo(inst, self);
+            },
+            .ptr_slice_ptr_ptr => if (use_old) try self.airPtrSlicePtrPtr(inst) else {
+                const ty_op = air_datas[@intFromEnum(inst)].ty_op;
+                var ops = try self.tempsFromOperands(inst, .{ty_op.operand});
+                try ops[0].toOffset(0, self);
+                try ops[0].moveTo(inst, self);
+            },
+            .array_to_slice => if (use_old) try self.airArrayToSlice(inst) else {
+                const ty_op = air_datas[@intFromEnum(inst)].ty_op;
+                var ops = try self.tempsFromOperands(inst, .{ty_op.operand});
+                var len = try self.tempFromValue(Type.usize, .{
+                    .immediate = self.typeOf(ty_op.operand).childType(zcu).arrayLen(zcu),
+                });
+                try ops[0].toPair(&len, self);
+                try ops[0].moveTo(inst, self);
+            },
+            .error_set_has_value => return self.fail("TODO implement error_set_has_value", .{}),
+            .field_parent_ptr => if (use_old) try self.airFieldParentPtr(inst) else {
+                const ty_pl = air_datas[@intFromEnum(inst)].ty_pl;
+                const extra = self.air.extraData(Air.FieldParentPtr, ty_pl.payload).data;
+                var ops = try self.tempsFromOperands(inst, .{extra.field_ptr});
+                try ops[0].toOffset(-self.fieldOffset(self.typeOfIndex(inst), self.typeOf(extra.field_ptr), extra.field_index), self);
+                try ops[0].moveTo(inst, self);
+            },
 
             .is_named_enum_value => return self.fail("TODO implement is_named_enum_value", .{}),
-            .error_set_has_value => return self.fail("TODO implement error_set_has_value", .{}),
+
+            .wasm_memory_size => unreachable,
+            .wasm_memory_grow => unreachable,
+
+            .addrspace_cast => {
+                const ty_op = air_datas[@intFromEnum(inst)].ty_op;
+                var ops = try self.tempsFromOperands(inst, .{ty_op.operand});
+                try ops[0].moveTo(inst, self);
+            },
+
             .vector_store_elem => return self.fail("TODO implement vector_store_elem", .{}),
 
             .c_va_arg => try self.airVaArg(inst),
@@ -2520,15 +2793,12 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
             .c_va_end => try self.airVaEnd(inst),
             .c_va_start => try self.airVaStart(inst),
 
-            .wasm_memory_size => unreachable,
-            .wasm_memory_grow => unreachable,
-
             .work_item_id => unreachable,
             .work_group_size => unreachable,
             .work_group_id => unreachable,
-            // zig fmt: on
         }
-        self.checkInvariantsAfterAirInst(inst, old_air_bookkeeping);
+        self.resetTemps();
+        self.checkInvariantsAfterAirInst();
     }
     verbose_tracking_log.debug("{}", .{self.fmtTracking()});
 }
@@ -2588,7 +2858,7 @@ fn genLazy(self: *Self, lazy_sym: link.File.LazySymbol) InnerError!void {
                 data_off += @intCast(tag_name_len + 1);
             }
 
-            try self.airTrap();
+            try self.asmOpOnly(.{ ._, .ud2 });
 
             for (exitlude_jump_relocs) |reloc| self.performReloc(reloc);
             try self.asmOpOnly(.{ ._, .ret });
@@ -2602,6 +2872,10 @@ fn genLazy(self: *Self, lazy_sym: link.File.LazySymbol) InnerError!void {
 
 fn getValue(self: *Self, value: MCValue, inst: ?Air.Inst.Index) !void {
     for (value.getRegs()) |reg| try self.register_manager.getReg(reg, inst);
+    switch (value) {
+        else => {},
+        .eflags, .register_overflow => self.eflags_inst = inst,
+    }
 }
 
 fn getValueIfFree(self: *Self, value: MCValue, inst: ?Air.Inst.Index) void {
@@ -2635,26 +2909,18 @@ fn processDeath(self: *Self, inst: Air.Inst.Index) !void {
     try self.inst_tracking.getPtr(inst).?.die(self, inst);
 }
 
-/// Called when there are no operands, and the instruction is always unreferenced.
-fn finishAirBookkeeping(self: *Self) void {
-    if (std.debug.runtime_safety) {
-        self.air_bookkeeping += 1;
-    }
-}
-
 fn finishAirResult(self: *Self, inst: Air.Inst.Index, result: MCValue) void {
     if (self.liveness.isUnused(inst) and self.air.instructions.items(.tag)[@intFromEnum(inst)] != .arg) switch (result) {
         .none, .dead, .unreach => {},
         else => unreachable, // Why didn't the result die?
     } else {
-        tracking_log.debug("%{d} => {} (birth)", .{ inst, result });
+        tracking_log.debug("{} => {} (birth)", .{ inst, result });
         self.inst_tracking.putAssumeCapacityNoClobber(inst, InstTracking.init(result));
         // In some cases, an operand may be reused as the result.
         // If that operand died and was a register, it was freed by
         // processDeath, so we have to "re-allocate" the register.
         self.getValueIfFree(result, inst);
     }
-    self.finishAirBookkeeping();
 }
 
 fn finishAir(
@@ -2663,11 +2929,10 @@ fn finishAir(
     result: MCValue,
     operands: [Liveness.bpi - 1]Air.Inst.Ref,
 ) !void {
-    var tomb_bits = self.liveness.getTombBits(inst);
-    for (operands) |op| {
-        const dies = @as(u1, @truncate(tomb_bits)) != 0;
-        tomb_bits >>= 1;
-        if (!dies) continue;
+    const tomb_bits = self.liveness.getTombBits(inst);
+    for (0.., operands) |op_index, op| {
+        if (tomb_bits & @as(Liveness.Bpi, 1) << @intCast(op_index) == 0) continue;
+        if (self.reused_operands.isSet(op_index)) continue;
         try self.processDeath(op.toIndexAllowNone() orelse continue);
     }
     self.finishAirResult(inst, result);
@@ -2715,7 +2980,7 @@ fn computeFrameLayout(self: *Self, cc: std.builtin.CallingConvention) !FrameLayo
             }
         };
         const sort_context = SortContext{ .frame_align = frame_align };
-        mem.sort(FrameIndex, stack_frame_order, sort_context, SortContext.lessThan);
+        std.mem.sort(FrameIndex, stack_frame_order, sort_context, SortContext.lessThan);
     }
 
     const call_frame_align = frame_align[@intFromEnum(FrameIndex.call_frame)];
@@ -2755,13 +3020,13 @@ fn computeFrameLayout(self: *Self, cc: std.builtin.CallingConvention) !FrameLayo
         @intCast(rsp_offset - frame_offset[@intFromEnum(FrameIndex.stack_frame)]);
 
     return .{
-        .stack_mask = @as(u32, math.maxInt(u32)) << @intCast(if (need_align_stack) @intFromEnum(needed_align) else 0),
+        .stack_mask = @as(u32, std.math.maxInt(u32)) << @intCast(if (need_align_stack) @intFromEnum(needed_align) else 0),
         .stack_adjust = @intCast(rsp_offset - frame_offset[@intFromEnum(FrameIndex.call_frame)]),
         .save_reg_list = save_reg_list,
     };
 }
 
-fn getFrameAddrAlignment(self: *Self, frame_addr: bits.FrameAddr) Alignment {
+fn getFrameAddrAlignment(self: *Self, frame_addr: bits.FrameAddr) InternPool.Alignment {
     const alloc_align = self.frame_allocs.get(@intFromEnum(frame_addr.index)).abi_align;
     return @enumFromInt(@min(@intFromEnum(alloc_align), @ctz(frame_addr.off)));
 }
@@ -2799,7 +3064,7 @@ fn allocMemPtr(self: *Self, inst: Air.Inst.Index) !FrameIndex {
     const ptr_ty = self.typeOfIndex(inst);
     const val_ty = ptr_ty.childType(zcu);
     return self.allocFrameIndex(FrameAlloc.init(.{
-        .size = math.cast(u32, val_ty.abiSize(zcu)) orelse {
+        .size = std.math.cast(u32, val_ty.abiSize(zcu)) orelse {
             return self.fail("type '{}' too big to fit into stack frame", .{val_ty.fmt(pt)});
         },
         .alignment = ptr_ty.ptrAlignment(zcu).max(.@"1"),
@@ -2817,7 +3082,7 @@ fn allocTempRegOrMem(self: *Self, elem_ty: Type, reg_ok: bool) !MCValue {
 fn allocRegOrMemAdvanced(self: *Self, ty: Type, inst: ?Air.Inst.Index, reg_ok: bool) !MCValue {
     const pt = self.pt;
     const zcu = pt.zcu;
-    const abi_size = math.cast(u32, ty.abiSize(zcu)) orelse {
+    const abi_size = std.math.cast(u32, ty.abiSize(zcu)) orelse {
         return self.fail("type '{}' too big to fit into stack frame", .{ty.fmt(pt)});
     };
 
@@ -2915,8 +3180,8 @@ fn restoreState(self: *Self, state: State, deaths: []const Air.Inst.Index, compt
     }
 
     if (opts.resurrect) for (
-        self.inst_tracking.keys()[0..state.inst_tracking_len],
-        self.inst_tracking.values()[0..state.inst_tracking_len],
+        self.inst_tracking.keys()[Temp.Index.max..state.inst_tracking_len],
+        self.inst_tracking.values()[Temp.Index.max..state.inst_tracking_len],
     ) |inst, *tracking| tracking.resurrect(inst, state.scope_generation);
     for (deaths) |death| try self.processDeath(death);
 
@@ -3326,7 +3591,7 @@ fn airIntCast(self: *Self, inst: Air.Inst.Index) !void {
 
             const dst_elem_abi_size = dst_ty.childType(zcu).abiSize(zcu);
             const src_elem_abi_size = src_ty.childType(zcu).abiSize(zcu);
-            switch (math.order(dst_elem_abi_size, src_elem_abi_size)) {
+            switch (std.math.order(dst_elem_abi_size, src_elem_abi_size)) {
                 .lt => {
                     const mir_tag: Mir.Inst.FixedTag = switch (dst_elem_abi_size) {
                         else => break :result null,
@@ -3490,8 +3755,8 @@ fn airIntCast(self: *Self, inst: Air.Inst.Index) !void {
         };
 
         const dst_mcv = if (dst_int_info.bits <= src_storage_bits and
-            math.divCeil(u16, dst_int_info.bits, 64) catch unreachable ==
-            math.divCeil(u32, src_storage_bits, 64) catch unreachable and
+            std.math.divCeil(u16, dst_int_info.bits, 64) catch unreachable ==
+            std.math.divCeil(u32, src_storage_bits, 64) catch unreachable and
             self.reuseOperand(inst, ty_op.operand, 0, src_mcv)) src_mcv else dst: {
             const dst_mcv = try self.allocRegOrMem(inst, true);
             try self.genCopy(min_ty, dst_mcv, src_mcv, .{});
@@ -3508,8 +3773,8 @@ fn airIntCast(self: *Self, inst: Air.Inst.Index) !void {
             break :result .{ .register = registerAlias(dst_mcv.getReg().?, dst_abi_size) };
         }
 
-        const src_limbs_len = math.divCeil(u16, src_int_info.bits, 64) catch unreachable;
-        const dst_limbs_len = math.divCeil(u16, dst_int_info.bits, 64) catch unreachable;
+        const src_limbs_len = std.math.divCeil(u16, src_int_info.bits, 64) catch unreachable;
+        const dst_limbs_len = std.math.divCeil(u16, dst_int_info.bits, 64) catch unreachable;
 
         const high_mcv: MCValue = if (dst_mcv.isMemory())
             dst_mcv.address().offset((src_limbs_len - 1) * 8).deref()
@@ -3629,7 +3894,7 @@ fn airTrunc(self: *Self, inst: Air.Inst.Index) !void {
             const dst_info = dst_elem_ty.intInfo(zcu);
             const src_info = src_elem_ty.intInfo(zcu);
 
-            const mask_val = try pt.intValue(src_elem_ty, @as(u64, math.maxInt(u64)) >> @intCast(64 - dst_info.bits));
+            const mask_val = try pt.intValue(src_elem_ty, @as(u64, std.math.maxInt(u64)) >> @intCast(64 - dst_info.bits));
 
             const splat_ty = try pt.vectorType(.{
                 .len = @intCast(@divExact(@as(u64, if (src_abi_size > 16) 256 else 128), src_info.bits)),
@@ -4127,7 +4392,7 @@ fn airAddSat(self: *Self, inst: Air.Inst.Index) !void {
         break :cc .o;
     } else cc: {
         try self.genSetReg(limit_reg, ty, .{
-            .immediate = @as(u64, math.maxInt(u64)) >> @intCast(64 - ty.bitSize(zcu)),
+            .immediate = @as(u64, std.math.maxInt(u64)) >> @intCast(64 - ty.bitSize(zcu)),
         }, .{});
 
         try self.genBinOpMir(.{ ._, .add }, ty, dst_mcv, rhs_mcv);
@@ -4380,7 +4645,7 @@ fn airMulSat(self: *Self, inst: Air.Inst.Index) !void {
             break :cc .o;
         } else cc: {
             try self.genSetReg(limit_reg, ty, .{
-                .immediate = @as(u64, math.maxInt(u64)) >> @intCast(64 - reg_bits),
+                .immediate = @as(u64, std.math.maxInt(u64)) >> @intCast(64 - reg_bits),
             }, .{});
             break :cc .c;
         };
@@ -4425,7 +4690,7 @@ fn airAddSubWithOverflow(self: *Self, inst: Air.Inst.Index) !void {
                 };
 
                 const tuple_ty = self.typeOfIndex(inst);
-                if (int_info.bits >= 8 and math.isPowerOfTwo(int_info.bits)) {
+                if (int_info.bits >= 8 and std.math.isPowerOfTwo(int_info.bits)) {
                     switch (partial_mcv) {
                         .register => |reg| {
                             self.eflags_inst = inst;
@@ -4503,7 +4768,7 @@ fn airShlWithOverflow(self: *Self, inst: Air.Inst.Index) !void {
                 const cc = Condition.ne;
 
                 const tuple_ty = self.typeOfIndex(inst);
-                if (int_info.bits >= 8 and math.isPowerOfTwo(int_info.bits)) {
+                if (int_info.bits >= 8 and std.math.isPowerOfTwo(int_info.bits)) {
                     switch (partial_mcv) {
                         .register => |reg| {
                             self.eflags_inst = inst;
@@ -4635,7 +4900,7 @@ fn airMulWithOverflow(self: *Self, inst: Air.Inst.Index) !void {
             if (dst_info.bits > 128 and dst_info.signedness == .unsigned) {
                 const slow_inc = self.hasFeature(.slow_incdec);
                 const abi_size: u32 = @intCast(dst_ty.abiSize(zcu));
-                const limb_len = math.divCeil(u32, abi_size, 8) catch unreachable;
+                const limb_len = std.math.divCeil(u32, abi_size, 8) catch unreachable;
 
                 try self.spillRegisters(&.{ .rax, .rcx, .rdx });
                 const reg_locks = self.register_manager.lockRegsAssumeUnused(3, .{ .rax, .rcx, .rdx });
@@ -5493,7 +5758,7 @@ fn airUnwrapErrUnionErr(self: *Self, inst: Air.Inst.Index) !void {
             break :result operand;
         }
 
-        const err_off = errUnionErrorOffset(payload_ty, zcu);
+        const err_off = codegen.errUnionErrorOffset(payload_ty, zcu);
         switch (operand) {
             .register => |reg| {
                 // TODO reuse operand
@@ -5551,7 +5816,7 @@ fn airUnwrapErrUnionErrPtr(self: *Self, inst: Air.Inst.Index) !void {
     const eu_ty = src_ty.childType(zcu);
     const pl_ty = eu_ty.errorUnionPayload(zcu);
     const err_ty = eu_ty.errorUnionSet(zcu);
-    const err_off: i32 = @intCast(errUnionErrorOffset(pl_ty, zcu));
+    const err_off: i32 = @intCast(codegen.errUnionErrorOffset(pl_ty, zcu));
     const err_abi_size: u32 = @intCast(err_ty.abiSize(zcu));
     try self.asmRegisterMemory(
         .{ ._, .mov },
@@ -5594,7 +5859,7 @@ fn airErrUnionPayloadPtrSet(self: *Self, inst: Air.Inst.Index) !void {
         const eu_ty = src_ty.childType(zcu);
         const pl_ty = eu_ty.errorUnionPayload(zcu);
         const err_ty = eu_ty.errorUnionSet(zcu);
-        const err_off: i32 = @intCast(errUnionErrorOffset(pl_ty, zcu));
+        const err_off: i32 = @intCast(codegen.errUnionErrorOffset(pl_ty, zcu));
         const err_abi_size: u32 = @intCast(err_ty.abiSize(zcu));
         try self.asmMemoryImmediate(
             .{ ._, .mov },
@@ -5618,7 +5883,7 @@ fn airErrUnionPayloadPtrSet(self: *Self, inst: Air.Inst.Index) !void {
         const dst_lock = self.register_manager.lockReg(dst_reg);
         defer if (dst_lock) |lock| self.register_manager.unlockReg(lock);
 
-        const pl_off: i32 = @intCast(errUnionPayloadOffset(pl_ty, zcu));
+        const pl_off: i32 = @intCast(codegen.errUnionPayloadOffset(pl_ty, zcu));
         const dst_abi_size: u32 = @intCast(dst_ty.abiSize(zcu));
         try self.asmRegisterMemory(
             .{ ._, .lea },
@@ -5646,7 +5911,7 @@ fn genUnwrapErrUnionPayloadMir(
     const result: MCValue = result: {
         if (!payload_ty.hasRuntimeBitsIgnoreComptime(zcu)) break :result .none;
 
-        const payload_off: u31 = @intCast(errUnionPayloadOffset(payload_ty, zcu));
+        const payload_off: u31 = @intCast(codegen.errUnionPayloadOffset(payload_ty, zcu));
         switch (err_union) {
             .load_frame => |frame_addr| break :result .{ .load_frame = .{
                 .index = frame_addr.index,
@@ -5695,7 +5960,7 @@ fn genUnwrapErrUnionPayloadPtrMir(
     const payload_ty = err_union_ty.errorUnionPayload(zcu);
 
     const result: MCValue = result: {
-        const payload_off = errUnionPayloadOffset(payload_ty, zcu);
+        const payload_off = codegen.errUnionPayloadOffset(payload_ty, zcu);
         const result_mcv: MCValue = if (maybe_inst) |inst|
             try self.copyToRegisterWithInstTracking(inst, ptr_ty, ptr_mcv)
         else
@@ -5792,8 +6057,8 @@ fn airWrapErrUnionPayload(self: *Self, inst: Air.Inst.Index) !void {
         if (!pl_ty.hasRuntimeBitsIgnoreComptime(zcu)) break :result .{ .immediate = 0 };
 
         const frame_index = try self.allocFrameIndex(FrameAlloc.initSpill(eu_ty, zcu));
-        const pl_off: i32 = @intCast(errUnionPayloadOffset(pl_ty, zcu));
-        const err_off: i32 = @intCast(errUnionErrorOffset(pl_ty, zcu));
+        const pl_off: i32 = @intCast(codegen.errUnionPayloadOffset(pl_ty, zcu));
+        const err_off: i32 = @intCast(codegen.errUnionErrorOffset(pl_ty, zcu));
         try self.genSetMem(.{ .frame = frame_index }, pl_off, pl_ty, operand, .{});
         try self.genSetMem(.{ .frame = frame_index }, err_off, err_ty, .{ .immediate = 0 }, .{});
         break :result .{ .load_frame = .{ .index = frame_index } };
@@ -5815,8 +6080,8 @@ fn airWrapErrUnionErr(self: *Self, inst: Air.Inst.Index) !void {
         if (!pl_ty.hasRuntimeBitsIgnoreComptime(zcu)) break :result try self.resolveInst(ty_op.operand);
 
         const frame_index = try self.allocFrameIndex(FrameAlloc.initSpill(eu_ty, zcu));
-        const pl_off: i32 = @intCast(errUnionPayloadOffset(pl_ty, zcu));
-        const err_off: i32 = @intCast(errUnionErrorOffset(pl_ty, zcu));
+        const pl_off: i32 = @intCast(codegen.errUnionPayloadOffset(pl_ty, zcu));
+        const err_off: i32 = @intCast(codegen.errUnionErrorOffset(pl_ty, zcu));
         try self.genSetMem(.{ .frame = frame_index }, pl_off, pl_ty, .undef, .{});
         const operand = try self.resolveInst(ty_op.operand);
         try self.genSetMem(.{ .frame = frame_index }, err_off, err_ty, operand, .{});
@@ -5829,11 +6094,20 @@ fn airSlicePtr(self: *Self, inst: Air.Inst.Index) !void {
     const ty_op = self.air.instructions.items(.data)[@intFromEnum(inst)].ty_op;
     const result = result: {
         const src_mcv = try self.resolveInst(ty_op.operand);
-        if (self.reuseOperand(inst, ty_op.operand, 0, src_mcv)) break :result src_mcv;
+        const ptr_mcv: MCValue = switch (src_mcv) {
+            .register_pair => |regs| .{ .register = regs[0] },
+            else => src_mcv,
+        };
+        if (self.reuseOperand(inst, ty_op.operand, 0, src_mcv)) {
+            switch (src_mcv) {
+                .register_pair => |regs| try self.freeValue(.{ .register = regs[1] }),
+                else => {},
+            }
+            break :result ptr_mcv;
+        }
 
         const dst_mcv = try self.allocRegOrMem(inst, true);
-        const dst_ty = self.typeOfIndex(inst);
-        try self.genCopy(dst_ty, dst_mcv, src_mcv, .{});
+        try self.genCopy(self.typeOfIndex(inst), dst_mcv, ptr_mcv, .{});
         break :result dst_mcv;
     };
     return self.finishAir(inst, result, .{ ty_op.operand, .none, .none });
@@ -5841,23 +6115,28 @@ fn airSlicePtr(self: *Self, inst: Air.Inst.Index) !void {
 
 fn airSliceLen(self: *Self, inst: Air.Inst.Index) !void {
     const ty_op = self.air.instructions.items(.data)[@intFromEnum(inst)].ty_op;
-
-    const result: MCValue = result: {
+    const result = result: {
         const src_mcv = try self.resolveInst(ty_op.operand);
-        switch (src_mcv) {
-            .load_frame => |frame_addr| {
-                const len_mcv: MCValue = .{ .load_frame = .{
-                    .index = frame_addr.index,
-                    .off = frame_addr.off + 8,
-                } };
-                if (self.reuseOperand(inst, ty_op.operand, 0, src_mcv)) break :result len_mcv;
-
-                const dst_mcv = try self.allocRegOrMem(inst, true);
-                try self.genCopy(Type.usize, dst_mcv, len_mcv, .{});
-                break :result dst_mcv;
-            },
+        const len_mcv: MCValue = switch (src_mcv) {
+            .register_pair => |regs| .{ .register = regs[1] },
+            .load_frame => |frame_addr| .{ .load_frame = .{
+                .index = frame_addr.index,
+                .off = frame_addr.off + 8,
+            } },
             else => return self.fail("TODO implement slice_len for {}", .{src_mcv}),
+        };
+        if (self.reuseOperand(inst, ty_op.operand, 0, src_mcv)) {
+            switch (src_mcv) {
+                .register_pair => |regs| try self.freeValue(.{ .register = regs[0] }),
+                .load_frame => {},
+                else => unreachable,
+            }
+            break :result len_mcv;
         }
+
+        const dst_mcv = try self.allocRegOrMem(inst, true);
+        try self.genCopy(self.typeOfIndex(inst), dst_mcv, len_mcv, .{});
+        break :result dst_mcv;
     };
     return self.finishAir(inst, result, .{ ty_op.operand, .none, .none });
 }
@@ -6355,7 +6634,7 @@ fn airClz(self: *Self, inst: Air.Inst.Index) !void {
         const src_bits: u31 = @intCast(src_ty.bitSize(zcu));
         const has_lzcnt = self.hasFeature(.lzcnt);
         if (src_bits > @as(u32, if (has_lzcnt) 128 else 64)) {
-            const limbs_len = math.divCeil(u32, abi_size, 8) catch unreachable;
+            const limbs_len = std.math.divCeil(u32, abi_size, 8) catch unreachable;
             const extra_bits = abi_size * 8 - src_bits;
 
             const index_reg = try self.register_manager.allocReg(null, abi.RegisterClass.gp);
@@ -6463,7 +6742,7 @@ fn airClz(self: *Self, inst: Air.Inst.Index) !void {
 
         assert(src_bits <= 64);
         const cmov_abi_size = @max(@as(u32, @intCast(dst_ty.abiSize(zcu))), 2);
-        if (math.isPowerOfTwo(src_bits)) {
+        if (std.math.isPowerOfTwo(src_bits)) {
             const imm_reg = try self.copyToTmpRegister(dst_ty, .{
                 .immediate = src_bits ^ (src_bits - 1),
             });
@@ -6488,7 +6767,7 @@ fn airClz(self: *Self, inst: Air.Inst.Index) !void {
             try self.genBinOpMir(.{ ._, .xor }, dst_ty, dst_mcv, .{ .immediate = src_bits - 1 });
         } else {
             const imm_reg = try self.copyToTmpRegister(dst_ty, .{
-                .immediate = @as(u64, math.maxInt(u64)) >> @intCast(64 - self.regBitSize(dst_ty)),
+                .immediate = @as(u64, std.math.maxInt(u64)) >> @intCast(64 - self.regBitSize(dst_ty)),
             });
             const imm_lock = self.register_manager.lockRegAssumeUnused(imm_reg);
             defer self.register_manager.unlockReg(imm_lock);
@@ -6552,7 +6831,7 @@ fn airCtz(self: *Self, inst: Air.Inst.Index) !void {
         const src_bits: u31 = @intCast(src_ty.bitSize(zcu));
         const has_bmi = self.hasFeature(.bmi);
         if (src_bits > @as(u32, if (has_bmi) 128 else 64)) {
-            const limbs_len = math.divCeil(u32, abi_size, 8) catch unreachable;
+            const limbs_len = std.math.divCeil(u32, abi_size, 8) catch unreachable;
             const extra_bits = abi_size * 8 - src_bits;
 
             const index_reg = try self.register_manager.allocReg(null, abi.RegisterClass.gp);
@@ -6617,7 +6896,7 @@ fn airCtz(self: *Self, inst: Air.Inst.Index) !void {
                         .{ ._, .@"or" },
                         wide_ty,
                         tmp_mcv,
-                        .{ .immediate = (@as(u64, math.maxInt(u64)) >> @intCast(64 - extra_bits)) <<
+                        .{ .immediate = (@as(u64, std.math.maxInt(u64)) >> @intCast(64 - extra_bits)) <<
                             @intCast(src_bits) },
                     );
                     break :masked tmp_mcv;
@@ -6644,7 +6923,7 @@ fn airCtz(self: *Self, inst: Air.Inst.Index) !void {
                         .{ ._, .@"or" },
                         Type.u64,
                         dst_mcv,
-                        .{ .immediate = @as(u64, math.maxInt(u64)) << @intCast(src_bits - 64) },
+                        .{ .immediate = @as(u64, std.math.maxInt(u64)) << @intCast(src_bits - 64) },
                     );
                     break :masked dst_mcv;
                 } else hi_mat_src_mcv;
@@ -6661,7 +6940,7 @@ fn airCtz(self: *Self, inst: Air.Inst.Index) !void {
         const width_lock = self.register_manager.lockRegAssumeUnused(width_reg);
         defer self.register_manager.unlockReg(width_lock);
 
-        if (src_bits <= 8 or !math.isPowerOfTwo(src_bits)) {
+        if (src_bits <= 8 or !std.math.isPowerOfTwo(src_bits)) {
             const wide_reg = try self.copyToTmpRegister(src_ty, mat_src_mcv);
             const wide_lock = self.register_manager.lockRegAssumeUnused(wide_reg);
             defer self.register_manager.unlockReg(wide_lock);
@@ -6760,7 +7039,7 @@ fn genPopCount(
         },
     );
 
-    const mask = @as(u64, math.maxInt(u64)) >> @intCast(64 - src_abi_size * 8);
+    const mask = @as(u64, std.math.maxInt(u64)) >> @intCast(64 - src_abi_size * 8);
     const imm_0_1 = Immediate.u(mask / 0b1_1);
     const imm_00_11 = Immediate.u(mask / 0b01_01);
     const imm_0000_1111 = Immediate.u(mask / 0b0001_0001);
@@ -6906,7 +7185,7 @@ fn genByteSwap(
             return .{ .register_pair = .{ dst_regs[1], dst_regs[0] } };
         },
         else => {
-            const limbs_len = math.divCeil(u32, abi_size, 8) catch unreachable;
+            const limbs_len = std.math.divCeil(u32, abi_size, 8) catch unreachable;
 
             const temp_regs =
                 try self.register_manager.allocRegs(4, .{null} ** 4, abi.RegisterClass.gp);
@@ -7053,7 +7332,7 @@ fn airBitReverse(self: *Self, inst: Air.Inst.Index) !void {
     else
         undefined;
 
-    const mask = @as(u64, math.maxInt(u64)) >> @intCast(64 - limb_abi_size * 8);
+    const mask = @as(u64, std.math.maxInt(u64)) >> @intCast(64 - limb_abi_size * 8);
     const imm_0000_1111 = Immediate.u(mask / 0b0001_0001);
     const imm_00_11 = Immediate.u(mask / 0b01_01);
     const imm_0_1 = Immediate.u(mask / 0b1_1);
@@ -7502,7 +7781,7 @@ fn airAbs(self: *Self, inst: Air.Inst.Index) !void {
                 },
                 else => {
                     const abi_size: u31 = @intCast(ty.abiSize(zcu));
-                    const limb_len = math.divCeil(u31, abi_size, 8) catch unreachable;
+                    const limb_len = std.math.divCeil(u31, abi_size, 8) catch unreachable;
 
                     const tmp_regs =
                         try self.register_manager.allocRegs(3, .{null} ** 3, abi.RegisterClass.gp);
@@ -7758,9 +8037,7 @@ fn airSqrt(self: *Self, inst: Air.Inst.Index) !void {
                 else => unreachable,
             },
             else => unreachable,
-        }) orelse return self.fail("TODO implement airSqrt for {}", .{
-            ty.fmt(pt),
-        });
+        }) orelse return self.fail("TODO implement airSqrt for {}", .{ty.fmt(pt)});
         switch (mir_tag[0]) {
             .v_ss, .v_sd => if (src_mcv.isMemory()) try self.asmRegisterRegisterMemory(
                 mir_tag,
@@ -7864,7 +8141,7 @@ fn reuseOperandAdvanced(
     }
 
     // Prevent the operand deaths processing code from deallocating it.
-    self.liveness.clearOperandDeath(inst, op_index);
+    self.reused_operands.set(op_index);
     const op_inst = operand.toIndex().?;
     self.getResolvedInstValue(op_inst).reuse(self, maybe_tracked_inst, op_inst);
 
@@ -8123,12 +8400,12 @@ fn packedStore(self: *Self, ptr_ty: Type, ptr_mcv: MCValue, src_mcv: MCValue) In
             } },
         };
 
-        const part_mask = (@as(u64, math.maxInt(u64)) >> @intCast(64 - part_bit_size)) <<
+        const part_mask = (@as(u64, std.math.maxInt(u64)) >> @intCast(64 - part_bit_size)) <<
             @intCast(part_bit_off);
-        const part_mask_not = part_mask ^ (@as(u64, math.maxInt(u64)) >> @intCast(64 - limb_abi_bits));
+        const part_mask_not = part_mask ^ (@as(u64, std.math.maxInt(u64)) >> @intCast(64 - limb_abi_bits));
         if (limb_abi_size <= 4) {
             try self.asmMemoryImmediate(.{ ._, .@"and" }, limb_mem, Immediate.u(part_mask_not));
-        } else if (math.cast(i32, @as(i64, @bitCast(part_mask_not)))) |small| {
+        } else if (std.math.cast(i32, @as(i64, @bitCast(part_mask_not)))) |small| {
             try self.asmMemoryImmediate(.{ ._, .@"and" }, limb_mem, Immediate.s(small));
         } else {
             const part_mask_reg = try self.register_manager.allocReg(null, abi.RegisterClass.gp);
@@ -8268,25 +8545,14 @@ fn airStructFieldPtr(self: *Self, inst: Air.Inst.Index) !void {
     return self.finishAir(inst, result, .{ extra.struct_operand, .none, .none });
 }
 
-fn airStructFieldPtrIndex(self: *Self, inst: Air.Inst.Index, index: u8) !void {
+fn airStructFieldPtrIndex(self: *Self, inst: Air.Inst.Index, field_index: u8) !void {
     const ty_op = self.air.instructions.items(.data)[@intFromEnum(inst)].ty_op;
-    const result = try self.fieldPtr(inst, ty_op.operand, index);
+    const result = try self.fieldPtr(inst, ty_op.operand, field_index);
     return self.finishAir(inst, result, .{ ty_op.operand, .none, .none });
 }
 
-fn fieldPtr(self: *Self, inst: Air.Inst.Index, operand: Air.Inst.Ref, index: u32) !MCValue {
-    const pt = self.pt;
-    const zcu = pt.zcu;
+fn fieldPtr(self: *Self, inst: Air.Inst.Index, operand: Air.Inst.Ref, field_index: u32) !MCValue {
     const ptr_field_ty = self.typeOfIndex(inst);
-    const ptr_container_ty = self.typeOf(operand);
-    const container_ty = ptr_container_ty.childType(zcu);
-
-    const field_off: i32 = switch (container_ty.containerLayout(zcu)) {
-        .auto, .@"extern" => @intCast(container_ty.structFieldOffset(index, zcu)),
-        .@"packed" => @divExact(@as(i32, ptr_container_ty.ptrInfo(zcu).packed_offset.bit_offset) +
-            (if (zcu.typeToStruct(container_ty)) |struct_obj| pt.structPackedFieldBitOffset(struct_obj, index) else 0) -
-            ptr_field_ty.ptrInfo(zcu).packed_offset.bit_offset, 8),
-    };
 
     const src_mcv = try self.resolveInst(operand);
     const dst_mcv = if (switch (src_mcv) {
@@ -8294,7 +8560,19 @@ fn fieldPtr(self: *Self, inst: Air.Inst.Index, operand: Air.Inst.Ref, index: u32
         .register, .register_offset => self.reuseOperand(inst, operand, 0, src_mcv),
         else => false,
     }) src_mcv else try self.copyToRegisterWithInstTracking(inst, ptr_field_ty, src_mcv);
-    return dst_mcv.offset(field_off);
+    return dst_mcv.offset(self.fieldOffset(self.typeOf(operand), ptr_field_ty, field_index));
+}
+
+fn fieldOffset(self: *Self, ptr_agg_ty: Type, ptr_field_ty: Type, field_index: u32) i32 {
+    const pt = self.pt;
+    const zcu = pt.zcu;
+    const agg_ty = ptr_agg_ty.childType(zcu);
+    return switch (agg_ty.containerLayout(zcu)) {
+        .auto, .@"extern" => @intCast(agg_ty.structFieldOffset(field_index, zcu)),
+        .@"packed" => @divExact(@as(i32, ptr_agg_ty.ptrInfo(zcu).packed_offset.bit_offset) +
+            (if (zcu.typeToStruct(agg_ty)) |struct_obj| pt.structPackedFieldBitOffset(struct_obj, field_index) else 0) -
+            ptr_field_ty.ptrInfo(zcu).packed_offset.bit_offset, 8),
+    };
 }
 
 fn airStructFieldVal(self: *Self, inst: Air.Inst.Index) !void {
@@ -8587,27 +8865,17 @@ fn airStructFieldVal(self: *Self, inst: Air.Inst.Index) !void {
 }
 
 fn airFieldParentPtr(self: *Self, inst: Air.Inst.Index) !void {
-    const pt = self.pt;
-    const zcu = pt.zcu;
     const ty_pl = self.air.instructions.items(.data)[@intFromEnum(inst)].ty_pl;
     const extra = self.air.extraData(Air.FieldParentPtr, ty_pl.payload).data;
 
-    const inst_ty = self.typeOfIndex(inst);
-    const parent_ty = inst_ty.childType(zcu);
-    const field_off: i32 = switch (parent_ty.containerLayout(zcu)) {
-        .auto, .@"extern" => @intCast(parent_ty.structFieldOffset(extra.field_index, zcu)),
-        .@"packed" => @divExact(@as(i32, inst_ty.ptrInfo(zcu).packed_offset.bit_offset) +
-            (if (zcu.typeToStruct(parent_ty)) |struct_obj| pt.structPackedFieldBitOffset(struct_obj, extra.field_index) else 0) -
-            self.typeOf(extra.field_ptr).ptrInfo(zcu).packed_offset.bit_offset, 8),
-    };
-
+    const ptr_agg_ty = self.typeOfIndex(inst);
     const src_mcv = try self.resolveInst(extra.field_ptr);
     const dst_mcv = if (src_mcv.isRegisterOffset() and
         self.reuseOperand(inst, extra.field_ptr, 0, src_mcv))
         src_mcv
     else
-        try self.copyToRegisterWithInstTracking(inst, inst_ty, src_mcv);
-    const result = dst_mcv.offset(-field_off);
+        try self.copyToRegisterWithInstTracking(inst, ptr_agg_ty, src_mcv);
+    const result = dst_mcv.offset(-self.fieldOffset(ptr_agg_ty, self.typeOf(extra.field_ptr), extra.field_index));
     return self.finishAir(inst, result, .{ extra.field_ptr, .none, .none });
 }
 
@@ -8672,7 +8940,7 @@ fn genUnOp(self: *Self, maybe_inst: ?Air.Inst.Index, tag: Air.Inst.Tag, src_air:
                 };
 
                 if (int_info.signedness == .unsigned and self.regExtraBits(limb_ty) > 0) {
-                    const mask = @as(u64, math.maxInt(u64)) >> @intCast(64 - limb_bits);
+                    const mask = @as(u64, std.math.maxInt(u64)) >> @intCast(64 - limb_bits);
                     try self.genBinOpMir(.{ ._, .xor }, limb_ty, limb_mcv, .{ .immediate = mask });
                 } else try self.genUnOpMir(.{ ._, .not }, limb_ty, limb_mcv);
             }
@@ -8757,7 +9025,7 @@ fn genShiftBinOpMir(
     try self.spillEflagsIfOccupied();
 
     if (abi_size > 16) {
-        const limbs_len = math.divCeil(u32, abi_size, 8) catch unreachable;
+        const limbs_len = std.math.divCeil(u32, abi_size, 8) catch unreachable;
         assert(shift_abi_size >= 1 and shift_abi_size <= 2);
 
         const rcx_lock: ?RegisterLock = switch (rhs_mcv) {
@@ -8800,7 +9068,7 @@ fn genShiftBinOpMir(
                         try self.asmRegisterImmediate(
                             .{ ._, .@"and" },
                             .cl,
-                            Immediate.u(math.maxInt(u6)),
+                            Immediate.u(std.math.maxInt(u6)),
                         );
                         try self.asmRegisterImmediate(
                             .{ ._r, .sh },
@@ -8837,7 +9105,7 @@ fn genShiftBinOpMir(
                         try self.asmRegisterImmediate(
                             .{ ._, .@"and" },
                             .cl,
-                            Immediate.u(math.maxInt(u6)),
+                            Immediate.u(std.math.maxInt(u6)),
                         );
                         try self.asmRegisterImmediate(
                             .{ ._r, .sh },
@@ -8902,7 +9170,7 @@ fn genShiftBinOpMir(
                     }, .sh },
                     temp_regs[2].to64(),
                     temp_regs[3].to64(),
-                    Immediate.u(shift_imm & math.maxInt(u6)),
+                    Immediate.u(shift_imm & std.math.maxInt(u6)),
                 ),
                 else => try self.asmRegisterRegisterRegister(.{ switch (tag[0]) {
                     ._l => ._ld,
@@ -8957,7 +9225,7 @@ fn genShiftBinOpMir(
             .immediate => |shift_imm| try self.asmRegisterImmediate(
                 tag,
                 temp_regs[2].to64(),
-                Immediate.u(shift_imm & math.maxInt(u6)),
+                Immediate.u(shift_imm & std.math.maxInt(u6)),
             ),
             else => try self.asmRegisterRegister(tag, temp_regs[2].to64(), .cl),
         }
@@ -9351,7 +9619,7 @@ fn genShiftBinOpMir(
                     .base = .{ .reg = .ds },
                     .mod = .{ .rm = .{
                         .size = Memory.Size.fromSize(abi_size),
-                        .disp = math.cast(i32, @as(i64, @bitCast(addr))) orelse
+                        .disp = std.math.cast(i32, @as(i64, @bitCast(addr))) orelse
                             return self.fail("TODO genShiftBinOpMir between {s} and {s}", .{
                             @tagName(lhs_mcv),
                             @tagName(shift_mcv),
@@ -9554,7 +9822,7 @@ fn genMulDivBinOp(
         switch (tag) {
             .mul, .mul_wrap => {
                 const slow_inc = self.hasFeature(.slow_incdec);
-                const limb_len = math.divCeil(u32, src_abi_size, 8) catch unreachable;
+                const limb_len = std.math.divCeil(u32, src_abi_size, 8) catch unreachable;
 
                 try self.spillRegisters(&.{ .rax, .rcx, .rdx });
                 const reg_locks = self.register_manager.lockRegs(3, .{ .rax, .rcx, .rdx });
@@ -10337,7 +10605,7 @@ fn genBinOp(
                         .lea_tlv,
                         .lea_frame,
                         => true,
-                        .memory => |addr| math.cast(i32, @as(i64, @bitCast(addr))) == null,
+                        .memory => |addr| std.math.cast(i32, @as(i64, @bitCast(addr))) == null,
                         else => false,
                         .register_pair,
                         .register_overflow,
@@ -11626,7 +11894,7 @@ fn genBinOpMir(
                             8 => try self.asmRegisterImmediate(
                                 mir_limb_tag,
                                 dst_alias,
-                                if (math.cast(i8, @as(i64, @bitCast(imm)))) |small|
+                                if (std.math.cast(i8, @as(i64, @bitCast(imm)))) |small|
                                     Immediate.s(small)
                                 else
                                     Immediate.u(@as(u8, @intCast(imm))),
@@ -11634,7 +11902,7 @@ fn genBinOpMir(
                             16 => try self.asmRegisterImmediate(
                                 mir_limb_tag,
                                 dst_alias,
-                                if (math.cast(i16, @as(i64, @bitCast(imm)))) |small|
+                                if (std.math.cast(i16, @as(i64, @bitCast(imm)))) |small|
                                     Immediate.s(small)
                                 else
                                     Immediate.u(@as(u16, @intCast(imm))),
@@ -11642,12 +11910,12 @@ fn genBinOpMir(
                             32 => try self.asmRegisterImmediate(
                                 mir_limb_tag,
                                 dst_alias,
-                                if (math.cast(i32, @as(i64, @bitCast(imm)))) |small|
+                                if (std.math.cast(i32, @as(i64, @bitCast(imm)))) |small|
                                     Immediate.s(small)
                                 else
                                     Immediate.u(@as(u32, @intCast(imm))),
                             ),
-                            64 => if (math.cast(i32, @as(i64, @bitCast(imm)))) |small|
+                            64 => if (std.math.cast(i32, @as(i64, @bitCast(imm)))) |small|
                                 try self.asmRegisterImmediate(mir_limb_tag, dst_alias, Immediate.s(small))
                             else
                                 try self.asmRegisterRegister(mir_limb_tag, dst_alias, registerAlias(
@@ -11678,7 +11946,7 @@ fn genBinOpMir(
                                     .base = .{ .reg = .ds },
                                     .mod = .{ .rm = .{
                                         .size = Memory.Size.fromSize(limb_abi_size),
-                                        .disp = math.cast(i32, addr + off) orelse break :direct,
+                                        .disp = std.math.cast(i32, addr + off) orelse break :direct,
                                     } },
                                 },
                                 .indirect => |reg_off| .{
@@ -11790,8 +12058,8 @@ fn genBinOpMir(
                 => null,
                 .memory, .load_symbol, .load_got, .load_direct, .load_tlv => src: {
                     switch (resolved_src_mcv) {
-                        .memory => |addr| if (math.cast(i32, @as(i64, @bitCast(addr))) != null and
-                            math.cast(i32, @as(i64, @bitCast(addr)) + abi_size - limb_abi_size) != null)
+                        .memory => |addr| if (std.math.cast(i32, @as(i64, @bitCast(addr))) != null and
+                            std.math.cast(i32, @as(i64, @bitCast(addr)) + abi_size - limb_abi_size) != null)
                             break :src null,
                         .load_symbol, .load_got, .load_direct, .load_tlv => {},
                         else => unreachable,
@@ -11882,7 +12150,7 @@ fn genBinOpMir(
                             8 => try self.asmMemoryImmediate(
                                 mir_limb_tag,
                                 dst_limb_mem,
-                                if (math.cast(i8, @as(i64, @bitCast(imm)))) |small|
+                                if (std.math.cast(i8, @as(i64, @bitCast(imm)))) |small|
                                     Immediate.s(small)
                                 else
                                     Immediate.u(@as(u8, @intCast(imm))),
@@ -11890,7 +12158,7 @@ fn genBinOpMir(
                             16 => try self.asmMemoryImmediate(
                                 mir_limb_tag,
                                 dst_limb_mem,
-                                if (math.cast(i16, @as(i64, @bitCast(imm)))) |small|
+                                if (std.math.cast(i16, @as(i64, @bitCast(imm)))) |small|
                                     Immediate.s(small)
                                 else
                                     Immediate.u(@as(u16, @intCast(imm))),
@@ -11898,12 +12166,12 @@ fn genBinOpMir(
                             32 => try self.asmMemoryImmediate(
                                 mir_limb_tag,
                                 dst_limb_mem,
-                                if (math.cast(i32, @as(i64, @bitCast(imm)))) |small|
+                                if (std.math.cast(i32, @as(i64, @bitCast(imm)))) |small|
                                     Immediate.s(small)
                                 else
                                     Immediate.u(@as(u32, @intCast(imm))),
                             ),
-                            64 => if (math.cast(i32, @as(i64, @bitCast(imm)))) |small|
+                            64 => if (std.math.cast(i32, @as(i64, @bitCast(imm)))) |small|
                                 try self.asmMemoryImmediate(
                                     mir_limb_tag,
                                     dst_limb_mem,
@@ -12032,7 +12300,7 @@ fn genIntMulComplexOpMir(self: *Self, dst_ty: Type, dst_mcv: MCValue, src_mcv: M
                     registerAlias(src_reg, abi_size),
                 ),
                 .immediate => |imm| {
-                    if (math.cast(i32, imm)) |small| {
+                    if (std.math.cast(i32, imm)) |small| {
                         try self.asmRegisterRegisterImmediate(
                             .{ .i_, .mul },
                             dst_alias,
@@ -12068,7 +12336,7 @@ fn genIntMulComplexOpMir(self: *Self, dst_ty: Type, dst_mcv: MCValue, src_mcv: M
                             .base = .{ .reg = .ds },
                             .mod = .{ .rm = .{
                                 .size = Memory.Size.fromSize(abi_size),
-                                .disp = math.cast(i32, @as(i64, @bitCast(addr))) orelse
+                                .disp = std.math.cast(i32, @as(i64, @bitCast(addr))) orelse
                                     return self.asmRegisterRegister(
                                     .{ .i_, .mul },
                                     dst_alias,
@@ -12239,7 +12507,6 @@ fn airDbgArg(self: *Self, inst: Air.Inst.Index) !void {
     for (self.args[self.arg_index..]) |arg| {
         if (arg != .none) break;
     } else try self.airDbgVarArgs();
-    self.finishAirBookkeeping();
 }
 
 fn airDbgVarArgs(self: *Self) !void {
@@ -12304,16 +12571,6 @@ fn genLocalDebugInfo(
     }
 }
 
-fn airTrap(self: *Self) !void {
-    try self.asmOpOnly(.{ ._, .ud2 });
-    self.finishAirBookkeeping();
-}
-
-fn airBreakpoint(self: *Self) !void {
-    try self.asmOpOnly(.{ ._, .int3 });
-    self.finishAirBookkeeping();
-}
-
 fn airRetAddr(self: *Self, inst: Air.Inst.Index) !void {
     const dst_mcv = try self.allocRegOrMem(inst, true);
     try self.genCopy(Type.usize, dst_mcv, .{ .load_frame = .{ .index = .ret_addr } }, .{});
@@ -12333,7 +12590,6 @@ fn airFence(self: *Self, inst: Air.Inst.Index) !void {
         .acquire, .release, .acq_rel => {},
         .seq_cst => try self.asmOpOnly(.{ ._, .mfence }),
     }
-    self.finishAirBookkeeping();
 }
 
 fn airCall(self: *Self, inst: Air.Inst.Index, modifier: std.builtin.CallModifier) !void {
@@ -12734,7 +12990,7 @@ fn airRetLoad(self: *Self, inst: Air.Inst.Index) !void {
     try self.exitlude_jump_relocs.append(self.gpa, jmp_reloc);
 }
 
-fn airCmp(self: *Self, inst: Air.Inst.Index, op: math.CompareOperator) !void {
+fn airCmp(self: *Self, inst: Air.Inst.Index, op: std.math.CompareOperator) !void {
     const pt = self.pt;
     const zcu = pt.zcu;
     const bin_op = self.air.instructions.items(.data)[@intFromEnum(inst)].bin_op;
@@ -12936,10 +13192,10 @@ fn airCmp(self: *Self, inst: Air.Inst.Index, op: math.CompareOperator) !void {
                                     .register_pair, .load_frame => null,
                                     .memory, .load_symbol, .load_got, .load_direct, .load_tlv => dst: {
                                         switch (resolved_dst_mcv) {
-                                            .memory => |addr| if (math.cast(
+                                            .memory => |addr| if (std.math.cast(
                                                 i32,
                                                 @as(i64, @bitCast(addr)),
-                                            ) != null and math.cast(
+                                            ) != null and std.math.cast(
                                                 i32,
                                                 @as(i64, @bitCast(addr)) + abi_size - 8,
                                             ) != null) break :dst null,
@@ -12997,10 +13253,10 @@ fn airCmp(self: *Self, inst: Air.Inst.Index, op: math.CompareOperator) !void {
                                     .register_pair, .load_frame => null,
                                     .memory, .load_symbol, .load_got, .load_direct, .load_tlv => src: {
                                         switch (resolved_src_mcv) {
-                                            .memory => |addr| if (math.cast(
+                                            .memory => |addr| if (std.math.cast(
                                                 i32,
                                                 @as(i64, @bitCast(addr)),
-                                            ) != null and math.cast(
+                                            ) != null and std.math.cast(
                                                 i32,
                                                 @as(i64, @bitCast(addr)) + abi_size - 8,
                                             ) != null) break :src null,
@@ -13040,7 +13296,7 @@ fn airCmp(self: *Self, inst: Air.Inst.Index, op: math.CompareOperator) !void {
                                 const locks = self.register_manager.lockRegsAssumeUnused(2, regs);
                                 defer for (locks) |lock| self.register_manager.unlockReg(lock);
 
-                                const limbs_len = math.divCeil(u16, abi_size, 8) catch unreachable;
+                                const limbs_len = std.math.divCeil(u16, abi_size, 8) catch unreachable;
                                 var limb_i: u16 = 0;
                                 while (limb_i < limbs_len) : (limb_i += 1) {
                                     const off = limb_i * 8;
@@ -13301,7 +13557,6 @@ fn airDbgStmt(self: *Self, inst: Air.Inst.Index) !void {
             .column = dbg_stmt.column,
         } },
     });
-    self.finishAirBookkeeping();
 }
 
 fn airDbgInlineBlock(self: *Self, inst: Air.Inst.Index) !void {
@@ -13399,7 +13654,6 @@ fn airCondBr(self: *Self, inst: Air.Inst.Index) !void {
     });
 
     // We already took care of pl_op.operand earlier, so there's nothing left to do.
-    self.finishAirBookkeeping();
 }
 
 fn isNull(self: *Self, inst: Air.Inst.Index, opt_ty: Type, opt_mcv: MCValue) !MCValue {
@@ -13414,7 +13668,7 @@ fn isNull(self: *Self, inst: Air.Inst.Index, opt_ty: Type, opt_mcv: MCValue) !MC
 
     const pl_ty = opt_ty.optionalChild(zcu);
 
-    const some_info: struct { off: i32, ty: Type } = if (opt_ty.optionalReprIsPayload(zcu))
+    const some_info: struct { off: u31, ty: Type } = if (opt_ty.optionalReprIsPayload(zcu))
         .{ .off = 0, .ty = if (pl_ty.isSlice(zcu)) pl_ty.slicePtrFieldType(zcu) else pl_ty }
     else
         .{ .off = @intCast(pl_ty.abiSize(zcu)), .ty = Type.bool };
@@ -13427,7 +13681,6 @@ fn isNull(self: *Self, inst: Air.Inst.Index, opt_ty: Type, opt_mcv: MCValue) !MC
         .undef,
         .immediate,
         .eflags,
-        .register_pair,
         .register_offset,
         .register_overflow,
         .lea_direct,
@@ -13458,6 +13711,24 @@ fn isNull(self: *Self, inst: Air.Inst.Index, opt_ty: Type, opt_mcv: MCValue) !MC
                 .{ ._, .bt },
                 registerAlias(opt_reg, opt_abi_size),
                 Immediate.u(@as(u6, @intCast(some_info.off * 8))),
+            );
+            return .{ .eflags = .nc };
+        },
+
+        .register_pair => |opt_regs| {
+            if (some_info.off == 0) {
+                const some_abi_size: u32 = @intCast(some_info.ty.abiSize(zcu));
+                const alias_reg = registerAlias(opt_regs[0], some_abi_size);
+                assert(some_abi_size * 8 == alias_reg.bitSize());
+                try self.asmRegisterRegister(.{ ._, .@"test" }, alias_reg, alias_reg);
+                return .{ .eflags = .z };
+            }
+            assert(some_info.ty.ip_index == .bool_type);
+            const opt_abi_size: u32 = @intCast(opt_ty.abiSize(zcu));
+            try self.asmRegisterImmediate(
+                .{ ._, .bt },
+                registerAlias(opt_regs[some_info.off / 8], opt_abi_size),
+                Immediate.u(@as(u6, @truncate(some_info.off * 8))),
             );
             return .{ .eflags = .nc };
         },
@@ -13561,7 +13832,7 @@ fn isErr(self: *Self, maybe_inst: ?Air.Inst.Index, eu_ty: Type, eu_mcv: MCValue)
 
     try self.spillEflagsIfOccupied();
 
-    const err_off: u31 = @intCast(errUnionErrorOffset(eu_ty.errorUnionPayload(zcu), zcu));
+    const err_off: u31 = @intCast(codegen.errUnionErrorOffset(eu_ty.errorUnionPayload(zcu), zcu));
     switch (eu_mcv) {
         .register => |reg| {
             const eu_lock = self.register_manager.lockReg(reg);
@@ -13618,7 +13889,7 @@ fn isErrPtr(self: *Self, maybe_inst: ?Air.Inst.Index, ptr_ty: Type, ptr_mcv: MCV
     const ptr_lock = self.register_manager.lockReg(ptr_reg);
     defer if (ptr_lock) |lock| self.register_manager.unlockReg(lock);
 
-    const err_off: u31 = @intCast(errUnionErrorOffset(eu_ty.errorUnionPayload(zcu), zcu));
+    const err_off: u31 = @intCast(codegen.errUnionErrorOffset(eu_ty.errorUnionPayload(zcu), zcu));
     try self.asmMemoryImmediate(
         .{ ._, .cmp },
         .{
@@ -13747,12 +14018,11 @@ fn airLoop(self: *Self, inst: Air.Inst.Index) !void {
 
     try self.loops.putNoClobber(self.gpa, inst, .{
         .state = state,
-        .jmp_target = @intCast(self.mir_instructions.len),
+        .target = @intCast(self.mir_instructions.len),
     });
     defer assert(self.loops.remove(inst));
 
     try self.genBodyBlock(body);
-    self.finishAirBookkeeping();
 }
 
 fn airBlock(self: *Self, inst: Air.Inst.Index) !void {
@@ -13790,7 +14060,6 @@ fn lowerBlock(self: *Self, inst: Air.Inst.Index, body: []const Air.Inst.Index) !
     const tracking = &self.inst_tracking.values()[inst_tracking_i];
     if (self.liveness.isUnused(inst)) try tracking.die(self, inst);
     self.getValueIfFree(tracking.short, inst);
-    self.finishAirBookkeeping();
 }
 
 fn lowerSwitchBr(self: *Self, inst: Air.Inst.Index, switch_br: Air.UnwrappedSwitch, condition: MCValue) !void {
@@ -13925,7 +14194,6 @@ fn airSwitchBr(self: *Self, inst: Air.Inst.Index) !void {
     try self.lowerSwitchBr(inst, switch_br, condition);
 
     // We already took care of pl_op.operand earlier, so there's nothing left to do
-    self.finishAirBookkeeping();
 }
 
 fn airLoopSwitchBr(self: *Self, inst: Air.Inst.Index) !void {
@@ -13954,7 +14222,7 @@ fn airLoopSwitchBr(self: *Self, inst: Air.Inst.Index) !void {
 
     try self.loops.putNoClobber(self.gpa, inst, .{
         .state = state,
-        .jmp_target = @intCast(self.mir_instructions.len),
+        .target = @intCast(self.mir_instructions.len),
     });
     defer assert(self.loops.remove(inst));
 
@@ -13964,7 +14232,6 @@ fn airLoopSwitchBr(self: *Self, inst: Air.Inst.Index) !void {
     try self.lowerSwitchBr(inst, switch_br, mat_cond);
 
     try self.processDeath(inst);
-    self.finishAirBookkeeping();
 }
 
 fn airSwitchDispatch(self: *Self, inst: Air.Inst.Index) !void {
@@ -14006,12 +14273,10 @@ fn airSwitchDispatch(self: *Self, inst: Air.Inst.Index) !void {
 
     // Emit a jump with a relocation. It will be patched up after the block ends.
     // Leave the jump offset undefined
-    _ = try self.asmJmpReloc(loop_data.jmp_target);
+    _ = try self.asmJmpReloc(loop_data.target);
 
     // Stop tracking block result without forgetting tracking info
     try self.freeValue(block_tracking.short);
-
-    self.finishAirBookkeeping();
 }
 
 fn performReloc(self: *Self, reloc: Mir.Inst.Index) void {
@@ -14084,8 +14349,6 @@ fn airBr(self: *Self, inst: Air.Inst.Index) !void {
 
     // Stop tracking block result without forgetting tracking info
     try self.freeValue(block_tracking.short);
-
-    self.finishAirBookkeeping();
 }
 
 fn airRepeat(self: *Self, inst: Air.Inst.Index) !void {
@@ -14097,8 +14360,7 @@ fn airRepeat(self: *Self, inst: Air.Inst.Index) !void {
         .resurrect = false,
         .close_scope = true,
     });
-    _ = try self.asmJmpReloc(repeat_info.jmp_target);
-    self.finishAirBookkeeping();
+    _ = try self.asmJmpReloc(repeat_info.target);
 }
 
 fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
@@ -14129,9 +14391,9 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
 
     var outputs_extra_i = extra_i;
     for (outputs) |output| {
-        const extra_bytes = mem.sliceAsBytes(self.air.extra[extra_i..]);
-        const constraint = mem.sliceTo(mem.sliceAsBytes(self.air.extra[extra_i..]), 0);
-        const name = mem.sliceTo(extra_bytes[constraint.len + 1 ..], 0);
+        const extra_bytes = std.mem.sliceAsBytes(self.air.extra[extra_i..]);
+        const constraint = std.mem.sliceTo(std.mem.sliceAsBytes(self.air.extra[extra_i..]), 0);
+        const name = std.mem.sliceTo(extra_bytes[constraint.len + 1 ..], 0);
         // This equation accounts for the fact that even if we have exactly 4 bytes
         // for the string, we still use the next u32 for the null terminator.
         extra_i += (constraint.len + name.len + (2 + 3)) / 4;
@@ -14158,8 +14420,8 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
         const is_early_clobber = constraint[1] == '&';
         const rest = constraint[@as(usize, 1) + @intFromBool(is_early_clobber) ..];
         const arg_mcv: MCValue = arg_mcv: {
-            const arg_maybe_reg: ?Register = if (mem.eql(u8, rest, "r") or
-                mem.eql(u8, rest, "f") or mem.eql(u8, rest, "x"))
+            const arg_maybe_reg: ?Register = if (std.mem.eql(u8, rest, "r") or
+                std.mem.eql(u8, rest, "f") or std.mem.eql(u8, rest, "x"))
                 registerAlias(
                     self.register_manager.tryAllocReg(maybe_inst, switch (rest[0]) {
                         'r' => abi.RegisterClass.gp,
@@ -14169,20 +14431,20 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
                     }) orelse return self.fail("ran out of registers lowering inline asm", .{}),
                     @intCast(ty.abiSize(zcu)),
                 )
-            else if (mem.eql(u8, rest, "m"))
+            else if (std.mem.eql(u8, rest, "m"))
                 if (output != .none) null else return self.fail(
                     "memory constraint unsupported for asm result: '{s}'",
                     .{constraint},
                 )
-            else if (mem.eql(u8, rest, "g") or
-                mem.eql(u8, rest, "rm") or mem.eql(u8, rest, "mr") or
-                mem.eql(u8, rest, "r,m") or mem.eql(u8, rest, "m,r"))
+            else if (std.mem.eql(u8, rest, "g") or
+                std.mem.eql(u8, rest, "rm") or std.mem.eql(u8, rest, "mr") or
+                std.mem.eql(u8, rest, "r,m") or std.mem.eql(u8, rest, "m,r"))
                 self.register_manager.tryAllocReg(maybe_inst, abi.RegisterClass.gp) orelse
                     if (output != .none)
                     null
                 else
                     return self.fail("ran out of registers lowering inline asm", .{})
-            else if (mem.startsWith(u8, rest, "{") and mem.endsWith(u8, rest, "}"))
+            else if (std.mem.startsWith(u8, rest, "{") and std.mem.endsWith(u8, rest, "}"))
                 parseRegName(rest["{".len .. rest.len - "}".len]) orelse
                     return self.fail("invalid register constraint: '{s}'", .{constraint})
             else if (rest.len == 1 and std.ascii.isDigit(rest[0])) {
@@ -14195,7 +14457,7 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
             break :arg_mcv if (arg_maybe_reg) |reg| .{ .register = reg } else arg: {
                 const ptr_mcv = try self.resolveInst(output);
                 switch (ptr_mcv) {
-                    .immediate => |addr| if (math.cast(i32, @as(i64, @bitCast(addr)))) |_|
+                    .immediate => |addr| if (std.math.cast(i32, @as(i64, @bitCast(addr)))) |_|
                         break :arg ptr_mcv.deref(),
                     .register, .register_offset, .lea_frame => break :arg ptr_mcv.deref(),
                     else => {},
@@ -14206,7 +14468,7 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
         if (arg_mcv.getReg()) |reg| if (RegisterManager.indexOfRegIntoTracked(reg)) |_| {
             _ = self.register_manager.lockReg(reg);
         };
-        if (!mem.eql(u8, name, "_"))
+        if (!std.mem.eql(u8, name, "_"))
             arg_map.putAssumeCapacityNoClobber(name, @intCast(args.items.len));
         args.appendAssumeCapacity(arg_mcv);
         if (output == .none) result = arg_mcv;
@@ -14214,17 +14476,17 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
     }
 
     for (inputs) |input| {
-        const input_bytes = mem.sliceAsBytes(self.air.extra[extra_i..]);
-        const constraint = mem.sliceTo(input_bytes, 0);
-        const name = mem.sliceTo(input_bytes[constraint.len + 1 ..], 0);
+        const input_bytes = std.mem.sliceAsBytes(self.air.extra[extra_i..]);
+        const constraint = std.mem.sliceTo(input_bytes, 0);
+        const name = std.mem.sliceTo(input_bytes[constraint.len + 1 ..], 0);
         // This equation accounts for the fact that even if we have exactly 4 bytes
         // for the string, we still use the next u32 for the null terminator.
         extra_i += (constraint.len + name.len + (2 + 3)) / 4;
 
         const ty = self.typeOf(input);
         const input_mcv = try self.resolveInst(input);
-        const arg_mcv: MCValue = if (mem.eql(u8, constraint, "r") or
-            mem.eql(u8, constraint, "f") or mem.eql(u8, constraint, "x"))
+        const arg_mcv: MCValue = if (std.mem.eql(u8, constraint, "r") or
+            std.mem.eql(u8, constraint, "f") or std.mem.eql(u8, constraint, "x"))
         arg: {
             const rc = switch (constraint[0]) {
                 'r' => abi.RegisterClass.gp,
@@ -14238,16 +14500,16 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
             const reg = try self.register_manager.allocReg(null, rc);
             try self.genSetReg(reg, ty, input_mcv, .{});
             break :arg .{ .register = registerAlias(reg, @intCast(ty.abiSize(zcu))) };
-        } else if (mem.eql(u8, constraint, "i") or mem.eql(u8, constraint, "n"))
+        } else if (std.mem.eql(u8, constraint, "i") or std.mem.eql(u8, constraint, "n"))
             switch (input_mcv) {
                 .immediate => |imm| .{ .immediate = imm },
                 else => return self.fail("immediate operand requires comptime value: '{s}'", .{
                     constraint,
                 }),
             }
-        else if (mem.eql(u8, constraint, "m")) arg: {
+        else if (std.mem.eql(u8, constraint, "m")) arg: {
             switch (input_mcv) {
-                .memory => |addr| if (math.cast(i32, @as(i64, @bitCast(addr)))) |_|
+                .memory => |addr| if (std.math.cast(i32, @as(i64, @bitCast(addr)))) |_|
                     break :arg input_mcv,
                 .indirect, .load_frame => break :arg input_mcv,
                 .load_symbol, .load_direct, .load_got, .load_tlv => {},
@@ -14264,22 +14526,22 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
             };
             try self.genSetReg(addr_reg, Type.usize, input_mcv.address(), .{});
             break :arg .{ .indirect = .{ .reg = addr_reg } };
-        } else if (mem.eql(u8, constraint, "g") or
-            mem.eql(u8, constraint, "rm") or mem.eql(u8, constraint, "mr") or
-            mem.eql(u8, constraint, "r,m") or mem.eql(u8, constraint, "m,r"))
+        } else if (std.mem.eql(u8, constraint, "g") or
+            std.mem.eql(u8, constraint, "rm") or std.mem.eql(u8, constraint, "mr") or
+            std.mem.eql(u8, constraint, "r,m") or std.mem.eql(u8, constraint, "m,r"))
         arg: {
             switch (input_mcv) {
                 .register, .indirect, .load_frame => break :arg input_mcv,
-                .memory => |addr| if (math.cast(i32, @as(i64, @bitCast(addr)))) |_|
+                .memory => |addr| if (std.math.cast(i32, @as(i64, @bitCast(addr)))) |_|
                     break :arg input_mcv,
                 else => {},
             }
             const temp_mcv = try self.allocTempRegOrMem(ty, true);
             try self.genCopy(ty, temp_mcv, input_mcv, .{});
             break :arg temp_mcv;
-        } else if (mem.eql(u8, constraint, "X"))
+        } else if (std.mem.eql(u8, constraint, "X"))
             input_mcv
-        else if (mem.startsWith(u8, constraint, "{") and mem.endsWith(u8, constraint, "}")) arg: {
+        else if (std.mem.startsWith(u8, constraint, "{") and std.mem.endsWith(u8, constraint, "}")) arg: {
             const reg = parseRegName(constraint["{".len .. constraint.len - "}".len]) orelse
                 return self.fail("invalid register constraint: '{s}'", .{constraint});
             try self.register_manager.getReg(reg, null);
@@ -14294,7 +14556,7 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
         if (arg_mcv.getReg()) |reg| if (RegisterManager.indexOfRegIntoTracked(reg)) |_| {
             _ = self.register_manager.lockReg(reg);
         };
-        if (!mem.eql(u8, name, "_"))
+        if (!std.mem.eql(u8, name, "_"))
             arg_map.putAssumeCapacityNoClobber(name, @intCast(args.items.len));
         args.appendAssumeCapacity(arg_mcv);
     }
@@ -14302,7 +14564,7 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
     {
         var clobber_i: u32 = 0;
         while (clobber_i < clobbers_len) : (clobber_i += 1) {
-            const clobber = mem.sliceTo(mem.sliceAsBytes(self.air.extra[extra_i..]), 0);
+            const clobber = std.mem.sliceTo(std.mem.sliceAsBytes(self.air.extra[extra_i..]), 0);
             // This equation accounts for the fact that even if we have exactly 4 bytes
             // for the string, we still use the next u32 for the null terminator.
             extra_i += clobber.len / 4 + 1;
@@ -14355,20 +14617,20 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
         labels.deinit(self.gpa);
     }
 
-    const asm_source = mem.sliceAsBytes(self.air.extra[extra_i..])[0..extra.data.source_len];
-    var line_it = mem.tokenizeAny(u8, asm_source, "\n\r;");
+    const asm_source = std.mem.sliceAsBytes(self.air.extra[extra_i..])[0..extra.data.source_len];
+    var line_it = std.mem.tokenizeAny(u8, asm_source, "\n\r;");
     next_line: while (line_it.next()) |line| {
-        var mnem_it = mem.tokenizeAny(u8, line, " \t");
-        var prefix: Instruction.Prefix = .none;
+        var mnem_it = std.mem.tokenizeAny(u8, line, " \t");
+        var prefix: encoder.Instruction.Prefix = .none;
         const mnem_str = while (mnem_it.next()) |mnem_str| {
             if (mnem_str[0] == '#') continue :next_line;
-            if (mem.startsWith(u8, mnem_str, "//")) continue :next_line;
-            if (std.meta.stringToEnum(Instruction.Prefix, mnem_str)) |pre| {
+            if (std.mem.startsWith(u8, mnem_str, "//")) continue :next_line;
+            if (std.meta.stringToEnum(encoder.Instruction.Prefix, mnem_str)) |pre| {
                 if (prefix != .none) return self.fail("extra prefix: '{s}'", .{mnem_str});
                 prefix = pre;
                 continue;
             }
-            if (!mem.endsWith(u8, mnem_str, ":")) break mnem_str;
+            if (!std.mem.endsWith(u8, mnem_str, ":")) break mnem_str;
             const label_name = mnem_str[0 .. mnem_str.len - ":".len];
             if (!Label.isValid(.definition, label_name))
                 return self.fail("invalid label: '{s}'", .{label_name});
@@ -14393,21 +14655,21 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
 
         var mnem_size: ?Memory.Size = if (prefix == .directive)
             null
-        else if (mem.endsWith(u8, mnem_str, "b"))
+        else if (std.mem.endsWith(u8, mnem_str, "b"))
             .byte
-        else if (mem.endsWith(u8, mnem_str, "w"))
+        else if (std.mem.endsWith(u8, mnem_str, "w"))
             .word
-        else if (mem.endsWith(u8, mnem_str, "l"))
+        else if (std.mem.endsWith(u8, mnem_str, "l"))
             .dword
-        else if (mem.endsWith(u8, mnem_str, "q") and
-            (std.mem.indexOfScalar(u8, "vp", mnem_str[0]) == null or !mem.endsWith(u8, mnem_str, "dq")))
+        else if (std.mem.endsWith(u8, mnem_str, "q") and
+            (std.mem.indexOfScalar(u8, "vp", mnem_str[0]) == null or !std.mem.endsWith(u8, mnem_str, "dq")))
             .qword
-        else if (mem.endsWith(u8, mnem_str, "t"))
+        else if (std.mem.endsWith(u8, mnem_str, "t"))
             .tbyte
         else
             null;
         const mnem_tag = while (true) break std.meta.stringToEnum(
-            Instruction.Mnemonic,
+            encoder.Instruction.Mnemonic,
             mnem_str[0 .. mnem_str.len - @intFromBool(mnem_size != null)],
         ) orelse if (mnem_size) |_| {
             mnem_size = null;
@@ -14428,18 +14690,18 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
             .{ ._, .pseudo }
         else for (std.enums.values(Mir.Inst.Fixes)) |fixes| {
             const fixes_name = @tagName(fixes);
-            const space_i = mem.indexOfScalar(u8, fixes_name, ' ');
+            const space_i = std.mem.indexOfScalar(u8, fixes_name, ' ');
             const fixes_prefix = if (space_i) |i|
-                std.meta.stringToEnum(Instruction.Prefix, fixes_name[0..i]).?
+                std.meta.stringToEnum(encoder.Instruction.Prefix, fixes_name[0..i]).?
             else
                 .none;
             if (fixes_prefix != prefix) continue;
             const pattern = fixes_name[if (space_i) |i| i + " ".len else 0..];
-            const wildcard_i = mem.indexOfScalar(u8, pattern, '_').?;
+            const wildcard_i = std.mem.indexOfScalar(u8, pattern, '_').?;
             const mnem_prefix = pattern[0..wildcard_i];
             const mnem_suffix = pattern[wildcard_i + "_".len ..];
-            if (!mem.startsWith(u8, mnem_name, mnem_prefix)) continue;
-            if (!mem.endsWith(u8, mnem_name, mnem_suffix)) continue;
+            if (!std.mem.startsWith(u8, mnem_name, mnem_prefix)) continue;
+            if (!std.mem.endsWith(u8, mnem_name, mnem_suffix)) continue;
             break .{ fixes, std.meta.stringToEnum(
                 Mir.Inst.Tag,
                 mnem_name[mnem_prefix.len .. mnem_name.len - mnem_suffix.len],
@@ -14461,21 +14723,21 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
         var ops: [4]Operand = .{.none} ** 4;
 
         var last_op = false;
-        var op_it = mem.splitScalar(u8, mnem_it.rest(), ',');
+        var op_it = std.mem.splitScalar(u8, mnem_it.rest(), ',');
         next_op: for (&ops) |*op| {
             const op_str = while (!last_op) {
                 const full_str = op_it.next() orelse break :next_op;
-                const code_str = if (mem.indexOfScalar(u8, full_str, '#') orelse
-                    mem.indexOf(u8, full_str, "//")) |comment|
+                const code_str = if (std.mem.indexOfScalar(u8, full_str, '#') orelse
+                    std.mem.indexOf(u8, full_str, "//")) |comment|
                 code: {
                     last_op = true;
                     break :code full_str[0..comment];
                 } else full_str;
-                const trim_str = mem.trim(u8, code_str, " \t*");
+                const trim_str = std.mem.trim(u8, code_str, " \t*");
                 if (trim_str.len > 0) break trim_str;
             } else break;
-            if (mem.startsWith(u8, op_str, "%%")) {
-                const colon = mem.indexOfScalarPos(u8, op_str, "%%".len + 2, ':');
+            if (std.mem.startsWith(u8, op_str, "%%")) {
+                const colon = std.mem.indexOfScalarPos(u8, op_str, "%%".len + 2, ':');
                 const reg = parseRegName(op_str["%%".len .. colon orelse op_str.len]) orelse
                     return self.fail("invalid register: '{s}'", .{op_str});
                 if (colon) |colon_pos| {
@@ -14493,8 +14755,8 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
                         return self.fail("invalid register size: '{s}'", .{op_str});
                     op.* = .{ .reg = reg };
                 }
-            } else if (mem.startsWith(u8, op_str, "%[") and mem.endsWith(u8, op_str, "]")) {
-                const colon = mem.indexOfScalarPos(u8, op_str, "%[".len, ':');
+            } else if (std.mem.startsWith(u8, op_str, "%[") and std.mem.endsWith(u8, op_str, "]")) {
+                const colon = std.mem.indexOfScalarPos(u8, op_str, "%[".len, ':');
                 const modifier = if (colon) |colon_pos|
                     op_str[colon_pos + ":".len .. op_str.len - "]".len]
                 else
@@ -14503,15 +14765,15 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
                     arg_map.get(op_str["%[".len .. colon orelse op_str.len - "]".len]) orelse
                         return self.fail("no matching constraint: '{s}'", .{op_str})
                 ]) {
-                    .immediate => |imm| if (mem.eql(u8, modifier, "") or mem.eql(u8, modifier, "c"))
+                    .immediate => |imm| if (std.mem.eql(u8, modifier, "") or std.mem.eql(u8, modifier, "c"))
                         .{ .imm = Immediate.u(imm) }
                     else
                         return self.fail("invalid modifier: '{s}'", .{modifier}),
-                    .register => |reg| if (mem.eql(u8, modifier, ""))
+                    .register => |reg| if (std.mem.eql(u8, modifier, ""))
                         .{ .reg = reg }
                     else
                         return self.fail("invalid modifier: '{s}'", .{modifier}),
-                    .memory => |addr| if (mem.eql(u8, modifier, "") or mem.eql(u8, modifier, "P"))
+                    .memory => |addr| if (std.mem.eql(u8, modifier, "") or std.mem.eql(u8, modifier, "P"))
                         .{ .mem = .{
                             .base = .{ .reg = .ds },
                             .mod = .{ .rm = .{
@@ -14522,7 +14784,7 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
                         } }
                     else
                         return self.fail("invalid modifier: '{s}'", .{modifier}),
-                    .indirect => |reg_off| if (mem.eql(u8, modifier, ""))
+                    .indirect => |reg_off| if (std.mem.eql(u8, modifier, ""))
                         .{ .mem = .{
                             .base = .{ .reg = reg_off.reg },
                             .mod = .{ .rm = .{
@@ -14533,7 +14795,7 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
                         } }
                     else
                         return self.fail("invalid modifier: '{s}'", .{modifier}),
-                    .load_frame => |frame_addr| if (mem.eql(u8, modifier, ""))
+                    .load_frame => |frame_addr| if (std.mem.eql(u8, modifier, ""))
                         .{ .mem = .{
                             .base = .{ .frame = frame_addr.index },
                             .mod = .{ .rm = .{
@@ -14544,42 +14806,42 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
                         } }
                     else
                         return self.fail("invalid modifier: '{s}'", .{modifier}),
-                    .lea_got => |sym_index| if (mem.eql(u8, modifier, "P"))
+                    .lea_got => |sym_index| if (std.mem.eql(u8, modifier, "P"))
                         .{ .reg = try self.copyToTmpRegister(Type.usize, .{ .lea_got = sym_index }) }
                     else
                         return self.fail("invalid modifier: '{s}'", .{modifier}),
-                    .lea_symbol => |sym_off| if (mem.eql(u8, modifier, "P"))
+                    .lea_symbol => |sym_off| if (std.mem.eql(u8, modifier, "P"))
                         .{ .reg = try self.copyToTmpRegister(Type.usize, .{ .lea_symbol = sym_off }) }
                     else
                         return self.fail("invalid modifier: '{s}'", .{modifier}),
                     else => return self.fail("invalid constraint: '{s}'", .{op_str}),
                 };
-            } else if (mem.startsWith(u8, op_str, "$")) {
+            } else if (std.mem.startsWith(u8, op_str, "$")) {
                 if (std.fmt.parseInt(i32, op_str["$".len..], 0)) |s| {
                     if (mnem_size) |size| {
-                        const max = @as(u64, math.maxInt(u64)) >> @intCast(64 - (size.bitSize() - 1));
+                        const max = @as(u64, std.math.maxInt(u64)) >> @intCast(64 - (size.bitSize() - 1));
                         if ((if (s < 0) ~s else s) > max)
                             return self.fail("invalid immediate size: '{s}'", .{op_str});
                     }
                     op.* = .{ .imm = Immediate.s(s) };
                 } else |_| if (std.fmt.parseInt(u64, op_str["$".len..], 0)) |u| {
                     if (mnem_size) |size| {
-                        const max = @as(u64, math.maxInt(u64)) >> @intCast(64 - size.bitSize());
+                        const max = @as(u64, std.math.maxInt(u64)) >> @intCast(64 - size.bitSize());
                         if (u > max)
                             return self.fail("invalid immediate size: '{s}'", .{op_str});
                     }
                     op.* = .{ .imm = Immediate.u(u) };
                 } else |_| return self.fail("invalid immediate: '{s}'", .{op_str});
-            } else if (mem.endsWith(u8, op_str, ")")) {
-                const open = mem.indexOfScalar(u8, op_str, '(') orelse
+            } else if (std.mem.endsWith(u8, op_str, ")")) {
+                const open = std.mem.indexOfScalar(u8, op_str, '(') orelse
                     return self.fail("invalid operand: '{s}'", .{op_str});
-                var sib_it = mem.splitScalar(u8, op_str[open + "(".len .. op_str.len - ")".len], ',');
+                var sib_it = std.mem.splitScalar(u8, op_str[open + "(".len .. op_str.len - ")".len], ',');
                 const base_str = sib_it.next() orelse
                     return self.fail("invalid memory operand: '{s}'", .{op_str});
-                if (base_str.len > 0 and !mem.startsWith(u8, base_str, "%%"))
+                if (base_str.len > 0 and !std.mem.startsWith(u8, base_str, "%%"))
                     return self.fail("invalid memory operand: '{s}'", .{op_str});
                 const index_str = sib_it.next() orelse "";
-                if (index_str.len > 0 and !mem.startsWith(u8, base_str, "%%"))
+                if (index_str.len > 0 and !std.mem.startsWith(u8, base_str, "%%"))
                     return self.fail("invalid memory operand: '{s}'", .{op_str});
                 const scale_str = sib_it.next() orelse "";
                 if (index_str.len == 0 and scale_str.len > 0)
@@ -14611,10 +14873,10 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
                             else
                                 .none,
                             .scale = scale,
-                            .disp = if (mem.startsWith(u8, op_str[0..open], "%[") and
-                                mem.endsWith(u8, op_str[0..open], "]"))
+                            .disp = if (std.mem.startsWith(u8, op_str[0..open], "%[") and
+                                std.mem.endsWith(u8, op_str[0..open], "]"))
                             disp: {
-                                const colon = mem.indexOfScalarPos(u8, op_str[0..open], "%[".len, ':');
+                                const colon = std.mem.indexOfScalarPos(u8, op_str[0..open], "%[".len, ':');
                                 const modifier = if (colon) |colon_pos|
                                     op_str[colon_pos + ":".len .. open - "]".len]
                                 else
@@ -14623,9 +14885,9 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
                                     arg_map.get(op_str["%[".len .. colon orelse open - "]".len]) orelse
                                         return self.fail("no matching constraint: '{s}'", .{op_str})
                                 ]) {
-                                    .immediate => |imm| if (mem.eql(u8, modifier, "") or
-                                        mem.eql(u8, modifier, "c"))
-                                        math.cast(i32, @as(i64, @bitCast(imm))) orelse
+                                    .immediate => |imm| if (std.mem.eql(u8, modifier, "") or
+                                        std.mem.eql(u8, modifier, "c"))
+                                        std.math.cast(i32, @as(i64, @bitCast(imm))) orelse
                                             return self.fail("invalid displacement: '{s}'", .{op_str})
                                     else
                                         return self.fail("invalid modifier: '{s}'", .{modifier}),
@@ -14791,10 +15053,10 @@ fn airAsm(self: *Self, inst: Air.Inst.Index) !void {
         return self.fail("undefined label: '{s}'", .{label.key_ptr.*});
 
     for (outputs, args.items[0..outputs.len]) |output, arg_mcv| {
-        const extra_bytes = mem.sliceAsBytes(self.air.extra[outputs_extra_i..]);
+        const extra_bytes = std.mem.sliceAsBytes(self.air.extra[outputs_extra_i..]);
         const constraint =
-            mem.sliceTo(mem.sliceAsBytes(self.air.extra[outputs_extra_i..]), 0);
-        const name = mem.sliceTo(extra_bytes[constraint.len + 1 ..], 0);
+            std.mem.sliceTo(std.mem.sliceAsBytes(self.air.extra[outputs_extra_i..]), 0);
+        const name = std.mem.sliceTo(extra_bytes[constraint.len + 1 ..], 0);
         // This equation accounts for the fact that even if we have exactly 4 bytes
         // for the string, we still use the next u32 for the null terminator.
         outputs_extra_i += (constraint.len + name.len + (2 + 3)) / 4;
@@ -14838,7 +15100,10 @@ const MoveStrategy = union(enum) {
 
     pub fn read(strat: MoveStrategy, self: *Self, dst_reg: Register, src_mem: Memory) !void {
         switch (strat) {
-            .move => |tag| try self.asmRegisterMemory(tag, dst_reg, src_mem),
+            .move => |tag| try self.asmRegisterMemory(tag, switch (tag[1]) {
+                else => dst_reg,
+                .lea => if (dst_reg.bitSize() >= 32) dst_reg else dst_reg.to32(),
+            }, src_mem),
             .x87_load_store => {
                 try self.asmMemory(.{ .f_, .ld }, src_mem);
                 assert(dst_reg != .st7);
@@ -14884,7 +15149,7 @@ fn moveStrategy(self: *Self, ty: Type, class: Register.Class, aligned: bool) !Mo
         .mmx => {},
         .sse => switch (ty.zigTypeTag(zcu)) {
             else => {
-                const classes = mem.sliceTo(&abi.classifySystemV(ty, zcu, self.target.*, .other), .none);
+                const classes = std.mem.sliceTo(&abi.classifySystemV(ty, zcu, self.target.*, .other), .none);
                 assert(std.mem.indexOfNone(abi.Class, classes, &.{
                     .integer, .sse, .sseup, .memory, .float, .float_combine,
                 }) == null);
@@ -15196,7 +15461,7 @@ fn genCopy(self: *Self, ty: Type, dst_mcv: MCValue, src_mcv: MCValue, opts: Copy
         ),
         .memory, .load_symbol, .load_direct, .load_got, .load_tlv => {
             switch (dst_mcv) {
-                .memory => |addr| if (math.cast(i32, @as(i64, @bitCast(addr)))) |small_addr|
+                .memory => |addr| if (std.math.cast(i32, @as(i64, @bitCast(addr)))) |small_addr|
                     return self.genSetMem(.{ .reg = .ds }, small_addr, ty, src_mcv, opts),
                 .load_symbol, .load_direct, .load_got, .load_tlv => {},
                 else => unreachable,
@@ -15264,7 +15529,7 @@ fn genSetReg(
                 // register is the fastest way to zero a register.
                 try self.spillEflagsIfOccupied();
                 try self.asmRegisterRegister(.{ ._, .xor }, dst_reg.to32(), dst_reg.to32());
-            } else if (abi_size > 4 and math.cast(u32, imm) != null) {
+            } else if (abi_size > 4 and std.math.cast(u32, imm) != null) {
                 // 32-bit moves zero-extend to 64-bit.
                 try self.asmRegisterImmediate(.{ ._, .mov }, dst_reg.to32(), Immediate.u(imm));
             } else if (abi_size <= 4 and @as(i64, @bitCast(imm)) < 0) {
@@ -15386,15 +15651,15 @@ fn genSetReg(
             .load_frame => |frame_addr| try self.moveStrategy(
                 ty,
                 dst_reg.class(),
-                self.getFrameAddrAlignment(frame_addr).compare(.gte, Alignment.fromLog2Units(
-                    math.log2_int_ceil(u10, @divExact(dst_reg.bitSize(), 8)),
+                self.getFrameAddrAlignment(frame_addr).compare(.gte, InternPool.Alignment.fromLog2Units(
+                    std.math.log2_int_ceil(u10, @divExact(dst_reg.bitSize(), 8)),
                 )),
             ),
             .lea_frame => .{ .move = .{ ._, .lea } },
             else => unreachable,
         }).read(self, registerAlias(dst_reg, abi_size), switch (src_mcv) {
             .register_offset, .indirect => |reg_off| .{
-                .base = .{ .reg = reg_off.reg },
+                .base = .{ .reg = reg_off.reg.to64() },
                 .mod = .{ .rm = .{
                     .size = self.memSize(ty),
                     .disp = reg_off.off,
@@ -15411,7 +15676,7 @@ fn genSetReg(
         }),
         .memory, .load_symbol, .load_direct, .load_got, .load_tlv => {
             switch (src_mcv) {
-                .memory => |addr| if (math.cast(i32, @as(i64, @bitCast(addr)))) |small_addr|
+                .memory => |addr| if (std.math.cast(i32, @as(i64, @bitCast(addr)))) |small_addr|
                     return (try self.moveStrategy(
                         ty,
                         dst_reg.class(),
@@ -15461,14 +15726,10 @@ fn genSetReg(
             const addr_lock = self.register_manager.lockRegAssumeUnused(addr_reg);
             defer self.register_manager.unlockReg(addr_lock);
 
-            try (try self.moveStrategy(ty, dst_reg.class(), false)).read(
-                self,
-                registerAlias(dst_reg, abi_size),
-                .{
-                    .base = .{ .reg = addr_reg },
-                    .mod = .{ .rm = .{ .size = self.memSize(ty) } },
-                },
-            );
+            try (try self.moveStrategy(ty, dst_reg.class(), false)).read(self, registerAlias(dst_reg, abi_size), .{
+                .base = .{ .reg = addr_reg.to64() },
+                .mod = .{ .rm = .{ .size = self.memSize(ty) } },
+            });
         },
         .lea_symbol => |sym_off| switch (self.bin_file.tag) {
             .elf, .macho => try self.asmRegisterMemory(
@@ -15556,7 +15817,7 @@ fn genSetMem(
                 );
             },
             3, 5...7 => unreachable,
-            else => if (math.cast(i32, @as(i64, @bitCast(imm)))) |small| {
+            else => if (std.math.cast(i32, @as(i64, @bitCast(imm)))) |small| {
                 try self.asmMemoryImmediate(
                     .{ ._, .mov },
                     .{ .base = base, .mod = .{ .rm = .{
@@ -15574,9 +15835,9 @@ fn genSetMem(
                         .disp = disp + offset,
                     } } },
                     if (ty.isSignedInt(zcu)) Immediate.s(
-                        @truncate(@as(i64, @bitCast(imm)) >> (math.cast(u6, offset * 8) orelse 63)),
+                        @truncate(@as(i64, @bitCast(imm)) >> (std.math.cast(u6, offset * 8) orelse 63)),
                     ) else Immediate.u(
-                        @as(u32, @truncate(if (math.cast(u6, offset * 8)) |shift| imm >> shift else 0)),
+                        @as(u32, @truncate(if (std.math.cast(u6, offset * 8)) |shift| imm >> shift else 0)),
                     ),
                 );
             },
@@ -15603,7 +15864,9 @@ fn genSetMem(
                 .general_purpose, .segment, .x87, .ip => @divExact(src_alias.bitSize(), 8),
                 .mmx, .sse => abi_size,
             });
-            const src_align = Alignment.fromNonzeroByteUnits(math.ceilPowerOfTwoAssert(u32, src_size));
+            const src_align = InternPool.Alignment.fromNonzeroByteUnits(
+                std.math.ceilPowerOfTwoAssert(u32, src_size),
+            );
             if (src_size > mem_size) {
                 const frame_index = try self.allocFrameIndex(FrameAlloc.init(.{
                     .size = src_size,
@@ -15922,7 +16185,7 @@ fn airBitCast(self: *Self, inst: Air.Inst.Index) !void {
         const dst_mcv = if (dst_rc.supersetOf(src_rc) and dst_ty.abiSize(zcu) <= src_ty.abiSize(zcu) and
             self.reuseOperand(inst, ty_op.operand, 0, src_mcv)) src_mcv else dst: {
             const dst_mcv = try self.allocRegOrMem(inst, true);
-            try self.genCopy(switch (math.order(dst_ty.abiSize(zcu), src_ty.abiSize(zcu))) {
+            try self.genCopy(switch (std.math.order(dst_ty.abiSize(zcu), src_ty.abiSize(zcu))) {
                 .lt => dst_ty,
                 .eq => if (!dst_mcv.isMemory() or src_mcv.isMemory()) dst_ty else src_ty,
                 .gt => src_ty,
@@ -15939,7 +16202,7 @@ fn airBitCast(self: *Self, inst: Air.Inst.Index) !void {
         const bit_size = dst_ty.bitSize(zcu);
         if (abi_size * 8 <= bit_size or dst_ty.isVector(zcu)) break :result dst_mcv;
 
-        const dst_limbs_len = math.divCeil(i32, @intCast(bit_size), 64) catch unreachable;
+        const dst_limbs_len = std.math.divCeil(i32, @intCast(bit_size), 64) catch unreachable;
         const high_mcv: MCValue = switch (dst_mcv) {
             .register => |dst_reg| .{ .register = dst_reg },
             .register_pair => |dst_regs| .{ .register = dst_regs[1] },
@@ -16001,7 +16264,7 @@ fn airFloatFromInt(self: *Self, inst: Air.Inst.Index) !void {
     const src_bits: u32 = @intCast(src_ty.bitSize(zcu));
     const src_signedness =
         if (src_ty.isAbiInt(zcu)) src_ty.intInfo(zcu).signedness else .unsigned;
-    const src_size = math.divCeil(u32, @max(switch (src_signedness) {
+    const src_size = std.math.divCeil(u32, @max(switch (src_signedness) {
         .signed => src_bits,
         .unsigned => src_bits + 1,
     }, 32), 8) catch unreachable;
@@ -16078,7 +16341,7 @@ fn airIntFromFloat(self: *Self, inst: Air.Inst.Index) !void {
     const dst_bits: u32 = @intCast(dst_ty.bitSize(zcu));
     const dst_signedness =
         if (dst_ty.isAbiInt(zcu)) dst_ty.intInfo(zcu).signedness else .unsigned;
-    const dst_size = math.divCeil(u32, @max(switch (dst_signedness) {
+    const dst_size = std.math.divCeil(u32, @max(switch (dst_signedness) {
         .signed => dst_bits,
         .unsigned => dst_bits + 1,
     }, 32), 8) catch unreachable;
@@ -16654,13 +16917,17 @@ fn airMemset(self: *Self, inst: Air.Inst.Index, safety: bool) !void {
         const reg_locks = self.register_manager.lockRegsAssumeUnused(4, .{ .rax, .rdi, .rsi, .rcx });
         defer for (reg_locks) |lock| self.register_manager.unlockReg(lock);
 
-        const dst_ptr = try self.resolveInst(bin_op.lhs);
-        const dst_ptr_ty = self.typeOf(bin_op.lhs);
-        const dst_ptr_lock: ?RegisterLock = switch (dst_ptr) {
-            .register => |reg| self.register_manager.lockRegAssumeUnused(reg),
-            else => null,
+        const dst = try self.resolveInst(bin_op.lhs);
+        const dst_ty = self.typeOf(bin_op.lhs);
+        const dst_locks: [2]?RegisterLock = switch (dst) {
+            .register => |dst_reg| .{ self.register_manager.lockRegAssumeUnused(dst_reg), null },
+            .register_pair => |dst_regs| .{
+                self.register_manager.lockRegAssumeUnused(dst_regs[0]),
+                self.register_manager.lockRegAssumeUnused(dst_regs[1]),
+            },
+            else => .{ null, null },
         };
-        defer if (dst_ptr_lock) |lock| self.register_manager.unlockReg(lock);
+        for (dst_locks) |dst_lock| if (dst_lock) |lock| self.register_manager.unlockReg(lock);
 
         const src_val = try self.resolveInst(bin_op.rhs);
         const elem_ty = self.typeOf(bin_op.rhs);
@@ -16673,16 +16940,20 @@ fn airMemset(self: *Self, inst: Air.Inst.Index, safety: bool) !void {
         const elem_abi_size: u31 = @intCast(elem_ty.abiSize(zcu));
 
         if (elem_abi_size == 1) {
-            const ptr: MCValue = switch (dst_ptr_ty.ptrSize(zcu)) {
-                // TODO: this only handles slices stored in the stack
-                .Slice => dst_ptr,
-                .One => dst_ptr,
+            const dst_ptr: MCValue = switch (dst_ty.ptrSize(zcu)) {
+                .Slice => switch (dst) {
+                    .register_pair => |dst_regs| .{ .register = dst_regs[0] },
+                    else => dst,
+                },
+                .One => dst,
                 .C, .Many => unreachable,
             };
-            const len: MCValue = switch (dst_ptr_ty.ptrSize(zcu)) {
-                // TODO: this only handles slices stored in the stack
-                .Slice => dst_ptr.address().offset(8).deref(),
-                .One => .{ .immediate = dst_ptr_ty.childType(zcu).arrayLen(zcu) },
+            const len: MCValue = switch (dst_ty.ptrSize(zcu)) {
+                .Slice => switch (dst) {
+                    .register_pair => |dst_regs| .{ .register = dst_regs[1] },
+                    else => dst.address().offset(8).deref(),
+                },
+                .One => .{ .immediate = dst_ty.childType(zcu).arrayLen(zcu) },
                 .C, .Many => unreachable,
             };
             const len_lock: ?RegisterLock = switch (len) {
@@ -16691,20 +16962,25 @@ fn airMemset(self: *Self, inst: Air.Inst.Index, safety: bool) !void {
             };
             defer if (len_lock) |lock| self.register_manager.unlockReg(lock);
 
-            try self.genInlineMemset(ptr, src_val, len, .{ .safety = safety });
+            try self.genInlineMemset(dst_ptr, src_val, len, .{ .safety = safety });
             break :result;
         }
 
         // Store the first element, and then rely on memcpy copying forwards.
         // Length zero requires a runtime check - so we handle arrays specially
         // here to elide it.
-        switch (dst_ptr_ty.ptrSize(zcu)) {
+        switch (dst_ty.ptrSize(zcu)) {
             .Slice => {
-                const slice_ptr_ty = dst_ptr_ty.slicePtrFieldType(zcu);
+                const slice_ptr_ty = dst_ty.slicePtrFieldType(zcu);
 
-                // TODO: this only handles slices stored in the stack
-                const ptr = dst_ptr;
-                const len = dst_ptr.address().offset(8).deref();
+                const dst_ptr: MCValue = switch (dst) {
+                    .register_pair => |dst_regs| .{ .register = dst_regs[0] },
+                    else => dst,
+                };
+                const len: MCValue = switch (dst) {
+                    .register_pair => |dst_regs| .{ .register = dst_regs[1] },
+                    else => dst.address().offset(8).deref(),
+                };
 
                 // Used to store the number of elements for comparison.
                 // After comparison, updated to store number of bytes needed to copy.
@@ -16717,38 +16993,7 @@ fn airMemset(self: *Self, inst: Air.Inst.Index, safety: bool) !void {
                 try self.asmRegisterRegister(.{ ._, .@"test" }, len_reg, len_reg);
 
                 const skip_reloc = try self.asmJccReloc(.z, undefined);
-                try self.store(slice_ptr_ty, ptr, src_val, .{ .safety = safety });
-
-                const second_elem_ptr_reg =
-                    try self.register_manager.allocReg(null, abi.RegisterClass.gp);
-                const second_elem_ptr_mcv: MCValue = .{ .register = second_elem_ptr_reg };
-                const second_elem_ptr_lock =
-                    self.register_manager.lockRegAssumeUnused(second_elem_ptr_reg);
-                defer self.register_manager.unlockReg(second_elem_ptr_lock);
-
-                try self.genSetReg(second_elem_ptr_reg, Type.usize, .{ .register_offset = .{
-                    .reg = try self.copyToTmpRegister(Type.usize, ptr),
-                    .off = elem_abi_size,
-                } }, .{});
-
-                try self.genBinOpMir(.{ ._, .sub }, Type.usize, len_mcv, .{ .immediate = 1 });
-                try self.asmRegisterRegisterImmediate(
-                    .{ .i_, .mul },
-                    len_reg,
-                    len_reg,
-                    Immediate.s(elem_abi_size),
-                );
-                try self.genInlineMemcpy(second_elem_ptr_mcv, ptr, len_mcv);
-
-                self.performReloc(skip_reloc);
-            },
-            .One => {
-                const elem_ptr_ty = try pt.singleMutPtrType(elem_ty);
-
-                const len = dst_ptr_ty.childType(zcu).arrayLen(zcu);
-
-                assert(len != 0); // prevented by Sema
-                try self.store(elem_ptr_ty, dst_ptr, src_val, .{ .safety = safety });
+                try self.store(slice_ptr_ty, dst_ptr, src_val, .{ .safety = safety });
 
                 const second_elem_ptr_reg =
                     try self.register_manager.allocReg(null, abi.RegisterClass.gp);
@@ -16762,8 +17007,39 @@ fn airMemset(self: *Self, inst: Air.Inst.Index, safety: bool) !void {
                     .off = elem_abi_size,
                 } }, .{});
 
+                try self.genBinOpMir(.{ ._, .sub }, Type.usize, len_mcv, .{ .immediate = 1 });
+                try self.asmRegisterRegisterImmediate(
+                    .{ .i_, .mul },
+                    len_reg,
+                    len_reg,
+                    Immediate.s(elem_abi_size),
+                );
+                try self.genInlineMemcpy(second_elem_ptr_mcv, dst_ptr, len_mcv);
+
+                self.performReloc(skip_reloc);
+            },
+            .One => {
+                const elem_ptr_ty = try pt.singleMutPtrType(elem_ty);
+
+                const len = dst_ty.childType(zcu).arrayLen(zcu);
+
+                assert(len != 0); // prevented by Sema
+                try self.store(elem_ptr_ty, dst, src_val, .{ .safety = safety });
+
+                const second_elem_ptr_reg =
+                    try self.register_manager.allocReg(null, abi.RegisterClass.gp);
+                const second_elem_ptr_mcv: MCValue = .{ .register = second_elem_ptr_reg };
+                const second_elem_ptr_lock =
+                    self.register_manager.lockRegAssumeUnused(second_elem_ptr_reg);
+                defer self.register_manager.unlockReg(second_elem_ptr_lock);
+
+                try self.genSetReg(second_elem_ptr_reg, Type.usize, .{ .register_offset = .{
+                    .reg = try self.copyToTmpRegister(Type.usize, dst),
+                    .off = elem_abi_size,
+                } }, .{});
+
                 const bytes_to_copy: MCValue = .{ .immediate = elem_abi_size * (len - 1) };
-                try self.genInlineMemcpy(second_elem_ptr_mcv, dst_ptr, bytes_to_copy);
+                try self.genInlineMemcpy(second_elem_ptr_mcv, dst, bytes_to_copy);
             },
             .C, .Many => unreachable,
         }
@@ -16780,48 +17056,72 @@ fn airMemcpy(self: *Self, inst: Air.Inst.Index) !void {
     const reg_locks = self.register_manager.lockRegsAssumeUnused(3, .{ .rdi, .rsi, .rcx });
     defer for (reg_locks) |lock| self.register_manager.unlockReg(lock);
 
-    const dst_ptr = try self.resolveInst(bin_op.lhs);
-    const dst_ptr_ty = self.typeOf(bin_op.lhs);
-    const dst_ptr_lock: ?RegisterLock = switch (dst_ptr) {
-        .register => |reg| self.register_manager.lockRegAssumeUnused(reg),
-        else => null,
+    const dst = try self.resolveInst(bin_op.lhs);
+    const dst_ty = self.typeOf(bin_op.lhs);
+    const dst_locks: [2]?RegisterLock = switch (dst) {
+        .register => |dst_reg| .{ self.register_manager.lockRegAssumeUnused(dst_reg), null },
+        .register_pair => |dst_regs| .{
+            self.register_manager.lockRegAssumeUnused(dst_regs[0]),
+            self.register_manager.lockReg(dst_regs[1]),
+        },
+        else => .{ null, null },
     };
-    defer if (dst_ptr_lock) |lock| self.register_manager.unlockReg(lock);
+    for (dst_locks) |dst_lock| if (dst_lock) |lock| self.register_manager.unlockReg(lock);
 
-    const src_ptr = try self.resolveInst(bin_op.rhs);
-    const src_ptr_lock: ?RegisterLock = switch (src_ptr) {
-        .register => |reg| self.register_manager.lockRegAssumeUnused(reg),
-        else => null,
+    const src = try self.resolveInst(bin_op.rhs);
+    const src_locks: [2]?RegisterLock = switch (src) {
+        .register => |src_reg| .{ self.register_manager.lockReg(src_reg), null },
+        .register_pair => |src_regs| .{
+            self.register_manager.lockRegAssumeUnused(src_regs[0]),
+            self.register_manager.lockRegAssumeUnused(src_regs[1]),
+        },
+        else => .{ null, null },
     };
-    defer if (src_ptr_lock) |lock| self.register_manager.unlockReg(lock);
+    for (src_locks) |src_lock| if (src_lock) |lock| self.register_manager.unlockReg(lock);
 
-    const len: MCValue = switch (dst_ptr_ty.ptrSize(zcu)) {
+    const len: MCValue = switch (dst_ty.ptrSize(zcu)) {
         .Slice => len: {
             const len_reg = try self.register_manager.allocReg(null, abi.RegisterClass.gp);
             const len_lock = self.register_manager.lockRegAssumeUnused(len_reg);
             defer self.register_manager.unlockReg(len_lock);
 
-            try self.asmRegisterMemoryImmediate(
-                .{ .i_, .mul },
-                len_reg,
-                try dst_ptr.address().offset(8).deref().mem(self, .qword),
-                Immediate.s(@intCast(dst_ptr_ty.childType(zcu).abiSize(zcu))),
-            );
+            switch (dst) {
+                .register_pair => |dst_regs| try self.asmRegisterRegisterImmediate(
+                    .{ .i_, .mul },
+                    len_reg,
+                    dst_regs[1],
+                    Immediate.s(@intCast(dst_ty.childType(zcu).abiSize(zcu))),
+                ),
+                else => try self.asmRegisterMemoryImmediate(
+                    .{ .i_, .mul },
+                    len_reg,
+                    try dst.address().offset(8).deref().mem(self, .qword),
+                    Immediate.s(@intCast(dst_ty.childType(zcu).abiSize(zcu))),
+                ),
+            }
             break :len .{ .register = len_reg };
         },
         .One => len: {
-            const array_ty = dst_ptr_ty.childType(zcu);
+            const array_ty = dst_ty.childType(zcu);
             break :len .{ .immediate = array_ty.arrayLen(zcu) * array_ty.childType(zcu).abiSize(zcu) };
         },
         .C, .Many => unreachable,
     };
     const len_lock: ?RegisterLock = switch (len) {
-        .register => |reg| self.register_manager.lockRegAssumeUnused(reg),
+        .register => |reg| self.register_manager.lockReg(reg),
         else => null,
     };
     defer if (len_lock) |lock| self.register_manager.unlockReg(lock);
 
-    // TODO: dst_ptr and src_ptr could be slices rather than raw pointers
+    const dst_ptr: MCValue = switch (dst) {
+        .register_pair => |dst_regs| .{ .register = dst_regs[0] },
+        else => dst,
+    };
+    const src_ptr: MCValue = switch (src) {
+        .register_pair => |src_regs| .{ .register = src_regs[0] },
+        else => src,
+    };
+
     try self.genInlineMemcpy(dst_ptr, src_ptr, len);
 
     return self.finishAir(inst, .unreach, .{ bin_op.lhs, bin_op.rhs, .none });
@@ -16991,11 +17291,11 @@ fn airSplat(self: *Self, inst: Air.Inst.Index) !void {
                 try self.genSetReg(
                     regs[1],
                     vector_ty,
-                    .{ .immediate = @as(u64, math.maxInt(u64)) >> @intCast(64 - vector_len) },
+                    .{ .immediate = @as(u64, std.math.maxInt(u64)) >> @intCast(64 - vector_len) },
                     .{},
                 );
                 const src_mcv = try self.resolveInst(ty_op.operand);
-                const abi_size = @max(math.divCeil(u32, vector_len, 8) catch unreachable, 4);
+                const abi_size = @max(std.math.divCeil(u32, vector_len, 8) catch unreachable, 4);
                 try self.asmCmovccRegisterRegister(
                     switch (src_mcv) {
                         .eflags => |cc| cc,
@@ -17710,7 +18010,7 @@ fn airShuffle(self: *Self, inst: Air.Inst.Index) !void {
             for (mask_elems, 0..) |maybe_mask_elem, elem_index| {
                 const mask_elem = maybe_mask_elem orelse continue;
                 const mask_elem_index =
-                    math.cast(u5, if (mask_elem < 0) ~mask_elem else mask_elem) orelse break :unpck;
+                    std.math.cast(u5, if (mask_elem < 0) ~mask_elem else mask_elem) orelse break :unpck;
                 const elem_byte = (elem_index >> 1) * elem_abi_size;
                 if (mask_elem_index * elem_abi_size != (elem_byte & 0b0111) | @as(u4, switch (variant) {
                     .unpckl => 0b0000,
@@ -17988,7 +18288,7 @@ fn airShuffle(self: *Self, inst: Air.Inst.Index) !void {
             for (mask_elems, 0..) |maybe_mask_elem, elem_index| {
                 const mask_elem = maybe_mask_elem orelse continue;
                 const mask_elem_index =
-                    math.cast(u4, if (mask_elem < 0) ~mask_elem else mask_elem) orelse break :blend;
+                    std.math.cast(u4, if (mask_elem < 0) ~mask_elem else mask_elem) orelse break :blend;
                 if (mask_elem_index != elem_index) break :blend;
 
                 const select = @as(u8, @intFromBool(mask_elem < 0)) << @truncate(elem_index);
@@ -18199,7 +18499,7 @@ fn airShuffle(self: *Self, inst: Air.Inst.Index) !void {
             ) |*select_mask_elem, maybe_mask_elem, elem_index| {
                 const mask_elem = maybe_mask_elem orelse continue;
                 const mask_elem_index =
-                    math.cast(u5, if (mask_elem < 0) ~mask_elem else mask_elem) orelse break :blendv;
+                    std.math.cast(u5, if (mask_elem < 0) ~mask_elem else mask_elem) orelse break :blendv;
                 if (mask_elem_index != elem_index) break :blendv;
 
                 select_mask_elem.* = (if (mask_elem < 0)
@@ -18441,7 +18741,9 @@ fn airShuffle(self: *Self, inst: Air.Inst.Index) !void {
 
         break :result null;
     }) orelse return self.fail("TODO implement airShuffle from {} and {} to {} with {}", .{
-        lhs_ty.fmt(pt),                              rhs_ty.fmt(pt), dst_ty.fmt(pt),
+        lhs_ty.fmt(pt),
+        rhs_ty.fmt(pt),
+        dst_ty.fmt(pt),
         Value.fromInterned(extra.mask).fmtValue(pt),
     });
     return self.finishAir(inst, result, .{ extra.a, extra.b, .none });
@@ -18458,7 +18760,7 @@ fn airReduce(self: *Self, inst: Air.Inst.Index) !void {
             try self.spillEflagsIfOccupied();
 
             const operand_mcv = try self.resolveInst(reduce.operand);
-            const mask_len = (math.cast(u6, operand_ty.vectorLen(zcu)) orelse
+            const mask_len = (std.math.cast(u6, operand_ty.vectorLen(zcu)) orelse
                 return self.fail("TODO implement airReduce for {}", .{operand_ty.fmt(pt)}));
             const mask = (@as(u64, 1) << mask_len) - 1;
             const abi_size: u32 = @intCast(operand_ty.abiSize(zcu));
@@ -18809,8 +19111,8 @@ fn airMulAdd(self: *Self, inst: Air.Inst.Index) !void {
             lock.* = self.register_manager.lockRegAssumeUnused(reg);
         }
 
-        const mir_tag = @as(?Mir.Inst.FixedTag, if (mem.eql(u2, &order, &.{ 1, 3, 2 }) or
-            mem.eql(u2, &order, &.{ 3, 1, 2 }))
+        const mir_tag = @as(?Mir.Inst.FixedTag, if (std.mem.eql(u2, &order, &.{ 1, 3, 2 }) or
+            std.mem.eql(u2, &order, &.{ 3, 1, 2 }))
             switch (ty.zigTypeTag(zcu)) {
                 .float => switch (ty.floatBits(self.target.*)) {
                     32 => .{ .v_ss, .fmadd132 },
@@ -18837,7 +19139,7 @@ fn airMulAdd(self: *Self, inst: Air.Inst.Index) !void {
                 },
                 else => unreachable,
             }
-        else if (mem.eql(u2, &order, &.{ 2, 1, 3 }) or mem.eql(u2, &order, &.{ 1, 2, 3 }))
+        else if (std.mem.eql(u2, &order, &.{ 2, 1, 3 }) or std.mem.eql(u2, &order, &.{ 1, 2, 3 }))
             switch (ty.zigTypeTag(zcu)) {
                 .float => switch (ty.floatBits(self.target.*)) {
                     32 => .{ .v_ss, .fmadd213 },
@@ -18864,7 +19166,7 @@ fn airMulAdd(self: *Self, inst: Air.Inst.Index) !void {
                 },
                 else => unreachable,
             }
-        else if (mem.eql(u2, &order, &.{ 2, 3, 1 }) or mem.eql(u2, &order, &.{ 3, 2, 1 }))
+        else if (std.mem.eql(u2, &order, &.{ 2, 3, 1 }) or std.mem.eql(u2, &order, &.{ 3, 2, 1 }))
             switch (ty.zigTypeTag(zcu)) {
                 .float => switch (ty.floatBits(self.target.*)) {
                     32 => .{ .v_ss, .fmadd231 },
@@ -19014,7 +19316,7 @@ fn airVaArg(self: *Self, inst: Air.Inst.Index) !void {
             const overflow_arg_area: MCValue = .{ .indirect = .{ .reg = ptr_arg_list_reg, .off = 8 } };
             const reg_save_area: MCValue = .{ .indirect = .{ .reg = ptr_arg_list_reg, .off = 16 } };
 
-            const classes = mem.sliceTo(&abi.classifySystemV(promote_ty, zcu, self.target.*, .arg), .none);
+            const classes = std.mem.sliceTo(&abi.classifySystemV(promote_ty, zcu, self.target.*, .arg), .none);
             switch (classes[0]) {
                 .integer => {
                     assert(classes.len == 1);
@@ -19116,9 +19418,7 @@ fn airVaArg(self: *Self, inst: Air.Inst.Index) !void {
                     assert(classes.len == 1);
                     unreachable;
                 },
-                else => return self.fail("TODO implement c_va_arg for {} on SysV", .{
-                    promote_ty.fmt(pt),
-                }),
+                else => return self.fail("TODO implement c_va_arg for {} on SysV", .{promote_ty.fmt(pt)}),
             }
 
             if (unused) break :result .unreach;
@@ -19255,7 +19555,7 @@ fn limitImmediateType(self: *Self, operand: Air.Inst.Ref, comptime T: type) !MCV
         .immediate => |imm| {
             // This immediate is unsigned.
             const U = std.meta.Int(.unsigned, ti.bits - @intFromBool(ti.signedness == .signed));
-            if (imm >= math.maxInt(U)) {
+            if (imm >= std.math.maxInt(U)) {
                 return MCValue{ .register = try self.copyToTmpRegister(Type.usize, mcv) };
             }
         },
@@ -19290,7 +19590,7 @@ const CallMCValues = struct {
     args: []MCValue,
     return_value: InstTracking,
     stack_byte_count: u31,
-    stack_align: Alignment,
+    stack_align: InternPool.Alignment,
     gp_count: u32,
     fp_count: u32,
 
@@ -19367,7 +19667,7 @@ fn resolveCallingConventionValues(
                 var ret_tracking_i: usize = 0;
 
                 const classes = switch (resolved_cc) {
-                    .SysV => mem.sliceTo(&abi.classifySystemV(ret_ty, zcu, self.target.*, .ret), .none),
+                    .SysV => std.mem.sliceTo(&abi.classifySystemV(ret_ty, zcu, self.target.*, .ret), .none),
                     .Win64 => &.{abi.classifyWindows(ret_ty, zcu)},
                     else => unreachable,
                 };
@@ -19442,7 +19742,7 @@ fn resolveCallingConventionValues(
                 var arg_mcv_i: usize = 0;
 
                 const classes = switch (resolved_cc) {
-                    .SysV => mem.sliceTo(&abi.classifySystemV(ty, zcu, self.target.*, .arg), .none),
+                    .SysV => std.mem.sliceTo(&abi.classifySystemV(ty, zcu, self.target.*, .arg), .none),
                     .Win64 => &.{abi.classifyWindows(ty, zcu)},
                     else => unreachable,
                 };
@@ -19499,7 +19799,7 @@ fn resolveCallingConventionValues(
 
                         const frame_elem_align = 8;
                         const frame_elems_len = ty.vectorLen(zcu) - remaining_param_int_regs;
-                        const frame_elem_size = mem.alignForward(
+                        const frame_elem_size = std.mem.alignForward(
                             u64,
                             ty.childType(zcu).abiSize(zcu),
                             frame_elem_align,
@@ -19507,7 +19807,7 @@ fn resolveCallingConventionValues(
                         const frame_size: u31 = @intCast(frame_elems_len * frame_elem_size);
 
                         result.stack_byte_count =
-                            mem.alignForward(u31, result.stack_byte_count, frame_elem_align);
+                            std.mem.alignForward(u31, result.stack_byte_count, frame_elem_align);
                         arg_mcv[arg_mcv_i] = .{ .elementwise_regs_then_frame = .{
                             .regs = remaining_param_int_regs,
                             .frame_off = @intCast(result.stack_byte_count),
@@ -19529,7 +19829,7 @@ fn resolveCallingConventionValues(
                 const param_align: u31 =
                     @intCast(@max(ty.abiAlignment(zcu).toByteUnits().?, 8));
                 result.stack_byte_count =
-                    mem.alignForward(u31, result.stack_byte_count, param_align);
+                    std.mem.alignForward(u31, result.stack_byte_count, param_align);
                 arg.* = .{ .load_frame = .{
                     .index = stack_frame_base,
                     .off = result.stack_byte_count,
@@ -19573,7 +19873,7 @@ fn resolveCallingConventionValues(
                 const param_size: u31 = @intCast(ty.abiSize(zcu));
                 const param_align: u31 = @intCast(ty.abiAlignment(zcu).toByteUnits().?);
                 result.stack_byte_count =
-                    mem.alignForward(u31, result.stack_byte_count, param_align);
+                    std.mem.alignForward(u31, result.stack_byte_count, param_align);
                 arg.* = .{ .load_frame = .{
                     .index = stack_frame_base,
                     .off = result.stack_byte_count,
@@ -19592,7 +19892,7 @@ fn fail(self: *Self, comptime format: []const u8, args: anytype) InnerError {
     @branchHint(.cold);
     assert(self.err_msg == null);
     const gpa = self.gpa;
-    self.err_msg = try ErrorMsg.create(gpa, self.src_loc, format, args);
+    self.err_msg = try Zcu.ErrorMsg.create(gpa, self.src_loc, format, args);
     return error.CodegenFail;
 }
 
@@ -19648,8 +19948,7 @@ fn registerAlias(reg: Register, size_bytes: u32) Register {
 }
 
 fn memSize(self: *Self, ty: Type) Memory.Size {
-    const pt = self.pt;
-    const zcu = pt.zcu;
+    const zcu = self.pt.zcu;
     return switch (ty.zigTypeTag(zcu)) {
         .float => Memory.Size.fromBitSize(ty.floatBits(self.target.*)),
         else => Memory.Size.fromSize(@intCast(ty.abiSize(zcu))),
@@ -19659,7 +19958,7 @@ fn memSize(self: *Self, ty: Type) Memory.Size {
 fn splitType(self: *Self, ty: Type) ![2]Type {
     const pt = self.pt;
     const zcu = pt.zcu;
-    const classes = mem.sliceTo(&abi.classifySystemV(ty, zcu, self.target.*, .other), .none);
+    const classes = std.mem.sliceTo(&abi.classifySystemV(ty, zcu, self.target.*, .other), .none);
     var parts: [2]Type = undefined;
     if (classes.len == 2) for (&parts, classes, 0..) |*part, class, part_i| {
         part.* = switch (class) {
@@ -19693,7 +19992,7 @@ fn truncateRegister(self: *Self, ty: Type, reg: Register) !void {
         .signedness = .unsigned,
         .bits = @intCast(ty.bitSize(zcu)),
     };
-    const shift = math.cast(u6, 64 - int_info.bits % 64) orelse return;
+    const shift = std.math.cast(u6, 64 - int_info.bits % 64) orelse return;
     try self.spillEflagsIfOccupied();
     switch (int_info.signedness) {
         .signed => {
@@ -19735,8 +20034,7 @@ fn truncateRegister(self: *Self, ty: Type, reg: Register) !void {
 }
 
 fn regBitSize(self: *Self, ty: Type) u64 {
-    const pt = self.pt;
-    const zcu = pt.zcu;
+    const zcu = self.pt.zcu;
     const abi_size = ty.abiSize(zcu);
     return switch (ty.zigTypeTag(zcu)) {
         else => switch (abi_size) {
@@ -19758,14 +20056,14 @@ fn regExtraBits(self: *Self, ty: Type) u64 {
     return self.regBitSize(ty) - ty.bitSize(self.pt.zcu);
 }
 
-fn hasFeature(self: *Self, feature: Target.x86.Feature) bool {
-    return Target.x86.featureSetHas(self.target.cpu.features, feature);
+fn hasFeature(self: *Self, feature: std.Target.x86.Feature) bool {
+    return std.Target.x86.featureSetHas(self.target.cpu.features, feature);
 }
 fn hasAnyFeatures(self: *Self, features: anytype) bool {
-    return Target.x86.featureSetHasAny(self.target.cpu.features, features);
+    return std.Target.x86.featureSetHasAny(self.target.cpu.features, features);
 }
 fn hasAllFeatures(self: *Self, features: anytype) bool {
-    return Target.x86.featureSetHasAll(self.target.cpu.features, features);
+    return std.Target.x86.featureSetHasAll(self.target.cpu.features, features);
 }
 
 fn typeOf(self: *Self, inst: Air.Inst.Ref) Type {
@@ -19777,9 +20075,13 @@ fn typeOf(self: *Self, inst: Air.Inst.Ref) Type {
 fn typeOfIndex(self: *Self, inst: Air.Inst.Index) Type {
     const pt = self.pt;
     const zcu = pt.zcu;
-    return switch (self.air.instructions.items(.tag)[@intFromEnum(inst)]) {
-        .loop_switch_br => self.typeOf(self.air.unwrapSwitch(inst).operand),
-        else => self.air.typeOfIndex(inst, &zcu.intern_pool),
+    const temp: Temp = .{ .index = inst };
+    return switch (temp.unwrap(self)) {
+        .ref => switch (self.air.instructions.items(.tag)[@intFromEnum(inst)]) {
+            .loop_switch_br => self.typeOf(self.air.unwrapSwitch(inst).operand),
+            else => self.air.typeOfIndex(inst, &zcu.intern_pool),
+        },
+        .temp => temp.typeOf(self),
     };
 }
 
@@ -19859,4 +20161,610 @@ fn promoteVarArg(self: *Self, ty: Type) Type {
             return Type.c_longdouble;
         },
     }
+}
+
+// ====================================== rewrite starts here ======================================
+
+const Temp = struct {
+    index: Air.Inst.Index,
+
+    fn unwrap(temp: Temp, self: *Self) union(enum) {
+        ref: Air.Inst.Ref,
+        temp: Index,
+    } {
+        switch (temp.index.unwrap()) {
+            .ref => |ref| return .{ .ref = ref },
+            .target => |target_index| {
+                const temp_index: Index = @enumFromInt(target_index);
+                assert(temp_index.isValid(self));
+                return .{ .temp = temp_index };
+            },
+        }
+    }
+
+    fn typeOf(temp: Temp, self: *Self) Type {
+        return switch (temp.unwrap(self)) {
+            .ref => |ref| self.typeOf(ref),
+            .temp => |temp_index| temp_index.typeOf(self),
+        };
+    }
+
+    fn isMut(temp: Temp, self: *Self) bool {
+        return temp.unwrap(self) == .temp;
+    }
+
+    fn tracking(temp: Temp, self: *Self) InstTracking {
+        return self.inst_tracking.get(temp.index).?;
+    }
+
+    fn getOffset(temp: Temp, off: i32, self: *Self) !Temp {
+        const new_temp_index = self.next_temp_index;
+        self.temp_type[@intFromEnum(new_temp_index)] = Type.usize;
+        self.next_temp_index = @enumFromInt(@intFromEnum(new_temp_index) + 1);
+        switch (temp.tracking(self).short) {
+            else => |tag| std.debug.panic("{s}: {any}\n", .{ @src().fn_name, tag }),
+            .register => |reg| {
+                const new_reg =
+                    try self.register_manager.allocReg(new_temp_index.toIndex(), abi.RegisterClass.gp);
+                new_temp_index.tracking(self).* = InstTracking.init(.{ .register = new_reg });
+                try self.asmRegisterMemory(.{ ._, .lea }, new_reg.to64(), .{
+                    .base = .{ .reg = reg.to64() },
+                    .mod = .{ .rm = .{
+                        .size = .qword,
+                        .disp = off,
+                    } },
+                });
+            },
+            .register_offset => |reg_off| {
+                const new_reg =
+                    try self.register_manager.allocReg(new_temp_index.toIndex(), abi.RegisterClass.gp);
+                new_temp_index.tracking(self).* = InstTracking.init(.{ .register = new_reg });
+                try self.asmRegisterMemory(.{ ._, .lea }, new_reg.to64(), .{
+                    .base = .{ .reg = reg_off.reg.to64() },
+                    .mod = .{ .rm = .{
+                        .size = .qword,
+                        .disp = reg_off.off + off,
+                    } },
+                });
+            },
+            .lea_symbol => |sym_off| new_temp_index.tracking(self).* = InstTracking.init(.{ .lea_symbol = .{
+                .sym_index = sym_off.sym_index,
+                .off = sym_off.off + off,
+            } }),
+            .load_frame => |frame_addr| {
+                const new_reg =
+                    try self.register_manager.allocReg(new_temp_index.toIndex(), abi.RegisterClass.gp);
+                new_temp_index.tracking(self).* = InstTracking.init(.{ .register_offset = .{
+                    .reg = new_reg,
+                    .off = off,
+                } });
+                try self.asmRegisterMemory(.{ ._, .mov }, new_reg.to64(), .{
+                    .base = .{ .frame = frame_addr.index },
+                    .mod = .{ .rm = .{
+                        .size = .qword,
+                        .disp = frame_addr.off,
+                    } },
+                });
+            },
+            .lea_frame => |frame_addr| new_temp_index.tracking(self).* = InstTracking.init(.{ .lea_frame = .{
+                .index = frame_addr.index,
+                .off = frame_addr.off + off,
+            } }),
+        }
+        return .{ .index = new_temp_index.toIndex() };
+    }
+
+    fn toOffset(temp: *Temp, off: i32, self: *Self) !void {
+        if (off == 0) return;
+        switch (temp.unwrap(self)) {
+            .ref => {},
+            .temp => |temp_index| {
+                const temp_tracking = temp_index.tracking(self);
+                switch (temp_tracking.short) {
+                    else => {},
+                    .register => |reg| {
+                        try self.freeValue(temp_tracking.long);
+                        temp_tracking.* = InstTracking.init(.{ .register_offset = .{
+                            .reg = reg,
+                            .off = off,
+                        } });
+                        return;
+                    },
+                    .register_offset => |reg_off| {
+                        try self.freeValue(temp_tracking.long);
+                        temp_tracking.* = InstTracking.init(.{ .register_offset = .{
+                            .reg = reg_off.reg,
+                            .off = reg_off.off + off,
+                        } });
+                        return;
+                    },
+                    .lea_symbol => |sym_off| {
+                        assert(std.meta.eql(temp_tracking.long.lea_symbol, sym_off));
+                        temp_tracking.* = InstTracking.init(.{ .lea_symbol = .{
+                            .sym_index = sym_off.sym_index,
+                            .off = sym_off.off + off,
+                        } });
+                        return;
+                    },
+                    .lea_frame => |frame_addr| {
+                        assert(std.meta.eql(temp_tracking.long.lea_frame, frame_addr));
+                        temp_tracking.* = InstTracking.init(.{ .lea_frame = .{
+                            .index = frame_addr.index,
+                            .off = frame_addr.off + off,
+                        } });
+                        return;
+                    },
+                }
+            },
+        }
+        const new_temp = try temp.getOffset(off, self);
+        try temp.die(self);
+        temp.* = new_temp;
+    }
+
+    fn getLimb(temp: Temp, limb_index: u28, self: *Self) !Temp {
+        const new_temp_index = self.next_temp_index;
+        self.temp_type[@intFromEnum(new_temp_index)] = Type.usize;
+        switch (temp.tracking(self).short) {
+            else => |tag| std.debug.panic("{s}: {any}\n", .{ @src().fn_name, tag }),
+            .immediate => |imm| {
+                assert(limb_index == 0);
+                new_temp_index.tracking(self).* = InstTracking.init(.{ .immediate = imm });
+            },
+            .register => |reg| {
+                assert(limb_index == 0);
+                const new_reg =
+                    try self.register_manager.allocReg(new_temp_index.toIndex(), abi.RegisterClass.gp);
+                new_temp_index.tracking(self).* = InstTracking.init(.{ .register = new_reg });
+                try self.asmRegisterRegister(.{ ._, .mov }, new_reg.to64(), reg.to64());
+            },
+            .register_pair => |regs| {
+                const new_reg =
+                    try self.register_manager.allocReg(new_temp_index.toIndex(), abi.RegisterClass.gp);
+                new_temp_index.tracking(self).* = InstTracking.init(.{ .register = new_reg });
+                try self.asmRegisterRegister(.{ ._, .mov }, new_reg.to64(), regs[limb_index].to64());
+            },
+            .register_offset => |reg_off| {
+                assert(limb_index == 0);
+                const new_reg =
+                    try self.register_manager.allocReg(new_temp_index.toIndex(), abi.RegisterClass.gp);
+                new_temp_index.tracking(self).* = InstTracking.init(.{ .register = new_reg });
+                try self.asmRegisterMemory(.{ ._, .lea }, new_reg.to64(), .{
+                    .base = .{ .reg = reg_off.reg.to64() },
+                    .mod = .{ .rm = .{
+                        .size = .qword,
+                        .disp = reg_off.off + @as(u31, limb_index) * 8,
+                    } },
+                });
+            },
+            .load_symbol => |sym_off| {
+                const new_reg =
+                    try self.register_manager.allocReg(new_temp_index.toIndex(), abi.RegisterClass.gp);
+                new_temp_index.tracking(self).* = InstTracking.init(.{ .register = new_reg });
+                try self.asmRegisterMemory(.{ ._, .mov }, new_reg.to64(), .{
+                    .base = .{ .reloc = sym_off.sym_index },
+                    .mod = .{ .rm = .{
+                        .size = .qword,
+                        .disp = sym_off.off + @as(u31, limb_index) * 8,
+                    } },
+                });
+            },
+            .lea_symbol => |sym_off| {
+                assert(limb_index == 0);
+                new_temp_index.tracking(self).* = InstTracking.init(.{ .lea_symbol = sym_off });
+            },
+            .load_frame => |frame_addr| {
+                const new_reg =
+                    try self.register_manager.allocReg(new_temp_index.toIndex(), abi.RegisterClass.gp);
+                new_temp_index.tracking(self).* = InstTracking.init(.{ .register = new_reg });
+                try self.asmRegisterMemory(.{ ._, .mov }, new_reg.to64(), .{
+                    .base = .{ .frame = frame_addr.index },
+                    .mod = .{ .rm = .{
+                        .size = .qword,
+                        .disp = frame_addr.off + @as(u31, limb_index) * 8,
+                    } },
+                });
+            },
+            .lea_frame => |frame_addr| {
+                assert(limb_index == 0);
+                new_temp_index.tracking(self).* = InstTracking.init(.{ .lea_frame = frame_addr });
+            },
+        }
+        self.next_temp_index = @enumFromInt(@intFromEnum(new_temp_index) + 1);
+        return .{ .index = new_temp_index.toIndex() };
+    }
+
+    fn toLimb(temp: *Temp, limb_index: u28, self: *Self) !void {
+        switch (temp.unwrap(self)) {
+            .ref => {},
+            .temp => |temp_index| {
+                const temp_tracking = temp_index.tracking(self);
+                switch (temp_tracking.short) {
+                    else => {},
+                    .register, .lea_symbol, .lea_frame => {
+                        assert(limb_index == 0);
+                        return;
+                    },
+                    .register_pair => |regs| {
+                        switch (temp_tracking.long) {
+                            .none, .reserved_frame => {},
+                            else => temp_tracking.long =
+                                temp_tracking.long.address().offset(@as(u31, limb_index) * 8).deref(),
+                        }
+                        for (regs, 0..) |reg, reg_index| if (reg_index != limb_index)
+                            self.register_manager.freeReg(reg);
+                        temp_tracking.* = InstTracking.init(.{ .register = regs[limb_index] });
+                        return;
+                    },
+                    .load_symbol => |sym_off| {
+                        assert(std.meta.eql(temp_tracking.long.load_symbol, sym_off));
+                        temp_tracking.* = InstTracking.init(.{ .load_symbol = .{
+                            .sym_index = sym_off.sym_index,
+                            .off = sym_off.off + @as(u31, limb_index) * 8,
+                        } });
+                        return;
+                    },
+                    .load_frame => |frame_addr| if (!frame_addr.index.isNamed()) {
+                        assert(std.meta.eql(temp_tracking.long.load_frame, frame_addr));
+                        temp_tracking.* = InstTracking.init(.{ .load_frame = .{
+                            .index = frame_addr.index,
+                            .off = frame_addr.off + @as(u31, limb_index) * 8,
+                        } });
+                        return;
+                    },
+                }
+            },
+        }
+        const new_temp = try temp.getLimb(limb_index, self);
+        try temp.die(self);
+        temp.* = new_temp;
+    }
+
+    fn toReg(temp: *Temp, new_reg: Register, self: *Self) !bool {
+        const val, const ty = switch (temp.unwrap(self)) {
+            .ref => |ref| .{ temp.tracking(self).short, self.typeOf(ref) },
+            .temp => |temp_index| val: {
+                const temp_tracking = temp_index.tracking(self);
+                if (temp_tracking.short == .register and
+                    temp_tracking.short.register == new_reg) return false;
+                break :val .{ temp_tracking.short, temp_index.typeOf(self) };
+            },
+        };
+        const new_temp_index = self.next_temp_index;
+        self.temp_type[@intFromEnum(new_temp_index)] = ty;
+        try self.genSetReg(new_reg, ty, val, .{});
+        new_temp_index.tracking(self).* = InstTracking.init(.{ .register = new_reg });
+        try temp.die(self);
+        self.next_temp_index = @enumFromInt(@intFromEnum(new_temp_index) + 1);
+        temp.* = .{ .index = new_temp_index.toIndex() };
+        return true;
+    }
+
+    fn toAnyReg(temp: *Temp, self: *Self) !bool {
+        const val, const ty = switch (temp.unwrap(self)) {
+            .ref => |ref| .{ temp.tracking(self).short, self.typeOf(ref) },
+            .temp => |temp_index| val: {
+                const temp_tracking = temp_index.tracking(self);
+                if (temp_tracking.short == .register) return false;
+                break :val .{ temp_tracking.short, temp_index.typeOf(self) };
+            },
+        };
+        const new_temp_index = self.next_temp_index;
+        self.temp_type[@intFromEnum(new_temp_index)] = ty;
+        const new_reg =
+            try self.register_manager.allocReg(new_temp_index.toIndex(), self.regClassForType(ty));
+        try self.genSetReg(new_reg, ty, val, .{});
+        new_temp_index.tracking(self).* = InstTracking.init(.{ .register = new_reg });
+        try temp.die(self);
+        self.next_temp_index = @enumFromInt(@intFromEnum(new_temp_index) + 1);
+        temp.* = .{ .index = new_temp_index.toIndex() };
+        return true;
+    }
+
+    fn toPair(first_temp: *Temp, second_temp: *Temp, self: *Self) !void {
+        while (true) for ([_]*Temp{ first_temp, second_temp }) |part_temp| {
+            if (try part_temp.toAnyReg(self)) break;
+        } else break;
+        const first_temp_tracking = first_temp.unwrap(self).temp.tracking(self);
+        const second_temp_tracking = second_temp.unwrap(self).temp.tracking(self);
+        const result: MCValue = .{ .register_pair = .{
+            first_temp_tracking.short.register,
+            second_temp_tracking.short.register,
+        } };
+        const result_temp_index = self.next_temp_index;
+        const result_temp: Temp = .{ .index = result_temp_index.toIndex() };
+        assert(self.reuseTemp(result_temp.index, first_temp.index, first_temp_tracking));
+        assert(self.reuseTemp(result_temp.index, second_temp.index, second_temp_tracking));
+        self.temp_type[@intFromEnum(result_temp_index)] = Type.slice_const_u8;
+        result_temp_index.tracking(self).* = InstTracking.init(result);
+        first_temp.* = result_temp;
+    }
+
+    fn toLea(temp: *Temp, self: *Self) !bool {
+        switch (temp.tracking(self).short) {
+            .none,
+            .unreach,
+            .dead,
+            .undef,
+            .eflags,
+            .register_pair,
+            .register_overflow,
+            .elementwise_regs_then_frame,
+            .reserved_frame,
+            .air_ref,
+            => unreachable, // not a valid pointer
+            .immediate,
+            .register,
+            .register_offset,
+            .lea_direct,
+            .lea_got,
+            .lea_tlv,
+            .lea_frame,
+            => return false,
+            .memory,
+            .indirect,
+            .load_symbol,
+            .load_direct,
+            .load_got,
+            .load_tlv,
+            .load_frame,
+            => return temp.toAnyReg(self),
+            .lea_symbol => |sym_off| {
+                const off = sym_off.off;
+                if (off == 0) return false;
+                try temp.toOffset(-off, self);
+                while (try temp.toAnyReg(self)) {}
+                try temp.toOffset(off, self);
+                return true;
+            },
+        }
+    }
+
+    fn load(ptr: *Temp, val_ty: Type, self: *Self) !Temp {
+        const val_abi_size: u32 = @intCast(val_ty.abiSize(self.pt.zcu));
+        const val = try self.tempAlloc(val_ty);
+        switch (val.tracking(self).short) {
+            else => |tag| std.debug.panic("{s}: {any}\n", .{ @src().fn_name, tag }),
+            .register => |val_reg| {
+                while (try ptr.toLea(self)) {}
+                switch (val_reg.class()) {
+                    .general_purpose => try self.asmRegisterMemory(
+                        .{ ._, .mov },
+                        registerAlias(val_reg, val_abi_size),
+                        try ptr.tracking(self).short.deref().mem(self, self.memSize(val_ty)),
+                    ),
+                    else => |tag| std.debug.panic("{s}: {any}\n", .{ @src().fn_name, tag }),
+                }
+            },
+            .load_frame => |val_frame_addr| {
+                var val_ptr = try self.tempFromValue(Type.usize, .{ .lea_frame = val_frame_addr });
+                var len = try self.tempFromValue(Type.usize, .{ .immediate = val_abi_size });
+                try val_ptr.memcpy(ptr, &len, self);
+                try val_ptr.die(self);
+                try len.die(self);
+            },
+        }
+        return val;
+    }
+
+    fn store(ptr: *Temp, val: *Temp, self: *Self) !void {
+        const val_ty = val.typeOf(self);
+        const val_abi_size: u32 = @intCast(val_ty.abiSize(self.pt.zcu));
+        val: switch (val.tracking(self).short) {
+            else => |tag| std.debug.panic("{s}: {any}\n", .{ @src().fn_name, tag }),
+            .immediate => |imm| if (std.math.cast(i32, imm)) |s| {
+                while (try ptr.toLea(self)) {}
+                try self.asmMemoryImmediate(
+                    .{ ._, .mov },
+                    try ptr.tracking(self).short.deref().mem(self, self.memSize(val_ty)),
+                    Immediate.s(s),
+                );
+            } else continue :val .{ .register = undefined },
+            .register => {
+                while (try ptr.toLea(self) or try val.toAnyReg(self)) {}
+                const val_reg = val.tracking(self).short.register;
+                switch (val_reg.class()) {
+                    .general_purpose => try self.asmMemoryRegister(
+                        .{ ._, .mov },
+                        try ptr.tracking(self).short.deref().mem(self, self.memSize(val_ty)),
+                        registerAlias(val_reg, val_abi_size),
+                    ),
+                    else => |tag| std.debug.panic("{s}: {any}\n", .{ @src().fn_name, tag }),
+                }
+            },
+        }
+    }
+
+    fn memcpy(dst: *Temp, src: *Temp, len: *Temp, self: *Self) !void {
+        while (true) for ([_]*Temp{ dst, src, len }, [_]Register{ .rdi, .rsi, .rcx }) |temp, reg| {
+            if (try temp.toReg(reg, self)) break;
+        } else break;
+        try self.asmOpOnly(.{ .@"rep _sb", .mov });
+    }
+
+    fn moveTo(temp: Temp, inst: Air.Inst.Index, self: *Self) !void {
+        if (self.liveness.isUnused(inst)) try temp.die(self) else switch (temp.unwrap(self)) {
+            .ref => {
+                const result = try self.allocRegOrMem(inst, true);
+                try self.genCopy(self.typeOfIndex(inst), result, temp.tracking(self).short, .{});
+                tracking_log.debug("{} => {} (birth)", .{ inst, result });
+                self.inst_tracking.putAssumeCapacityNoClobber(inst, InstTracking.init(result));
+            },
+            .temp => |temp_index| {
+                const temp_tracking = temp_index.tracking(self);
+                tracking_log.debug("{} => {} (birth)", .{ inst, temp_tracking.short });
+                self.inst_tracking.putAssumeCapacityNoClobber(inst, temp_tracking.*);
+                assert(self.reuseTemp(inst, temp_index.toIndex(), temp_tracking));
+            },
+        }
+    }
+
+    fn die(temp: Temp, self: *Self) !void {
+        switch (temp.unwrap(self)) {
+            .ref => {},
+            .temp => |temp_index| try temp_index.tracking(self).die(self, temp_index.toIndex()),
+        }
+    }
+
+    const Index = enum(u4) {
+        _,
+
+        fn toIndex(index: Index) Air.Inst.Index {
+            return Air.Inst.Index.fromTargetIndex(@intFromEnum(index));
+        }
+
+        fn fromIndex(index: Air.Inst.Index) Index {
+            return @enumFromInt(index.toTargetIndex());
+        }
+
+        fn tracking(index: Index, self: *Self) *InstTracking {
+            return &self.inst_tracking.values()[@intFromEnum(index)];
+        }
+
+        fn isValid(index: Index, self: *Self) bool {
+            return index.tracking(self).short != .dead;
+        }
+
+        fn typeOf(index: Index, self: *Self) Type {
+            assert(index.isValid(self));
+            return self.temp_type[@intFromEnum(index)];
+        }
+
+        const max = std.math.maxInt(@typeInfo(Index).@"enum".tag_type);
+        const Set = std.StaticBitSet(max);
+        const SafetySet = if (std.debug.runtime_safety) Set else struct {
+            inline fn initEmpty() @This() {
+                return .{};
+            }
+
+            inline fn isSet(_: @This(), index: usize) bool {
+                assert(index < max);
+                return true;
+            }
+
+            inline fn set(_: @This(), index: usize) void {
+                assert(index < max);
+            }
+
+            inline fn eql(_: @This(), _: @This()) bool {
+                return true;
+            }
+        };
+    };
+};
+
+fn resetTemps(self: *Self) void {
+    for (0..@intFromEnum(self.next_temp_index)) |temp_index| {
+        const temp: Temp.Index = @enumFromInt(temp_index);
+        assert(!temp.isValid(self));
+        self.temp_type[temp_index] = undefined;
+    }
+    self.next_temp_index = @enumFromInt(0);
+}
+
+fn reuseTemp(
+    self: *Self,
+    new_inst: Air.Inst.Index,
+    old_inst: Air.Inst.Index,
+    tracking: *InstTracking,
+) bool {
+    switch (tracking.short) {
+        .register,
+        .register_pair,
+        .register_offset,
+        .register_overflow,
+        => for (tracking.short.getRegs()) |tracked_reg| {
+            if (RegisterManager.indexOfRegIntoTracked(tracked_reg)) |tracked_index| {
+                self.register_manager.registers[tracked_index] = new_inst;
+            }
+        },
+        .load_frame => |frame_addr| if (frame_addr.index.isNamed()) return false,
+        else => {},
+    }
+    switch (tracking.short) {
+        .eflags, .register_overflow => self.eflags_inst = new_inst,
+        else => {},
+    }
+    tracking.reuse(self, new_inst, old_inst);
+    return true;
+}
+
+fn tempAlloc(self: *Self, ty: Type) !Temp {
+    const temp_index = self.next_temp_index;
+    temp_index.tracking(self).* = InstTracking.init(try self.allocRegOrMemAdvanced(ty, temp_index.toIndex(), true));
+    self.temp_type[@intFromEnum(temp_index)] = ty;
+    self.next_temp_index = @enumFromInt(@intFromEnum(temp_index) + 1);
+    return .{ .index = temp_index.toIndex() };
+}
+
+fn tempFromValue(self: *Self, ty: Type, value: MCValue) !Temp {
+    const temp_index = self.next_temp_index;
+    temp_index.tracking(self).* = InstTracking.init(value);
+    self.temp_type[@intFromEnum(temp_index)] = ty;
+    try self.getValue(value, temp_index.toIndex());
+    self.next_temp_index = @enumFromInt(@intFromEnum(temp_index) + 1);
+    return .{ .index = temp_index.toIndex() };
+}
+
+fn tempFromOperand(
+    self: *Self,
+    inst: Air.Inst.Index,
+    op_index: Liveness.OperandInt,
+    op_ref: Air.Inst.Ref,
+) !Temp {
+    const zcu = self.pt.zcu;
+    const ip = &zcu.intern_pool;
+
+    if (!self.liveness.operandDies(inst, op_index)) {
+        if (op_ref.toIndex()) |op_inst| return .{ .index = op_inst };
+        const val = op_ref.toInterned().?;
+        const gop = try self.const_tracking.getOrPut(self.gpa, val);
+        if (!gop.found_existing) gop.value_ptr.* = InstTracking.init(init: {
+            const const_mcv = try self.genTypedValue(Value.fromInterned(val));
+            switch (const_mcv) {
+                .lea_tlv => |tlv_sym| switch (self.bin_file.tag) {
+                    .elf, .macho => {
+                        if (self.mod.pic) {
+                            try self.spillRegisters(&.{ .rdi, .rax });
+                        } else {
+                            try self.spillRegisters(&.{.rax});
+                        }
+                        const frame_index = try self.allocFrameIndex(FrameAlloc.init(.{
+                            .size = 8,
+                            .alignment = .@"8",
+                        }));
+                        try self.genSetMem(
+                            .{ .frame = frame_index },
+                            0,
+                            Type.usize,
+                            .{ .lea_symbol = .{ .sym_index = tlv_sym } },
+                            .{},
+                        );
+                        break :init .{ .load_frame = .{ .index = frame_index } };
+                    },
+                    else => break :init const_mcv,
+                },
+                else => break :init const_mcv,
+            }
+        });
+        return self.tempFromValue(Type.fromInterned(ip.typeOf(val)), gop.value_ptr.short);
+    }
+
+    const temp_index = self.next_temp_index;
+    const temp: Temp = .{ .index = temp_index.toIndex() };
+    const op_inst = op_ref.toIndex().?;
+    const tracking = self.getResolvedInstValue(op_inst);
+    temp_index.tracking(self).* = tracking.*;
+    if (!self.reuseTemp(temp.index, op_inst, tracking)) return .{ .index = op_ref.toIndex().? };
+    self.temp_type[@intFromEnum(temp_index)] = self.typeOf(op_ref);
+    self.next_temp_index = @enumFromInt(@intFromEnum(temp_index) + 1);
+    return temp;
+}
+
+inline fn tempsFromOperands(self: *Self, inst: Air.Inst.Index, op_refs: anytype) ![op_refs.len]Temp {
+    var temps: [op_refs.len]Temp = undefined;
+    inline for (&temps, 0.., op_refs) |*temp, op_index, op_ref| {
+        temp.* = try self.tempFromOperand(inst, op_index, op_ref);
+    }
+    return temps;
 }
