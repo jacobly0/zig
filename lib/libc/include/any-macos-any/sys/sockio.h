@@ -146,6 +146,7 @@
 
 #define SIOCSIFMANAGEMENT       _IOWR('i', 92, struct ifreq)   /* set management interface */
 
+
 #define SIOCIFCREATE    _IOWR('i', 120, struct ifreq)   /* create clone if */
 #define SIOCIFDESTROY    _IOW('i', 121, struct ifreq)   /* destroy clone if */
 #define SIOCIFCREATE2   _IOWR('i', 122, struct ifreq)   /* create clone if with data */
@@ -178,5 +179,7 @@
 #define SIOCSIF6LOWPAN  _IOW('i', 196, struct ifreq)    /* set 6LOWPAN config */
 #define SIOCGIF6LOWPAN  _IOWR('i', 197, struct ifreq)   /* get 6LOWPAN config */
 
+
+#define SIOCGIFDIRECTLINK _IOWR('i', 219, struct ifreq) /* get DIRECTLINK */
 
 #endif /* !_SYS_SOCKIO_H_ */
