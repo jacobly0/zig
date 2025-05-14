@@ -524,13 +524,20 @@ pub const Register = enum(u8) {
     }
 
     pub fn toBitSize(reg: Register, bit_size: u64) Register {
-        return switch (bit_size) {
-            8 => reg.to8(),
-            16 => reg.to16(),
-            32 => reg.to32(),
-            64 => reg.to64(),
-            128 => reg.to128(),
-            256 => reg.to256(),
+        return reg.toSize(.fromBitSize(bit_size));
+    }
+
+    pub fn toSize(reg: Register, size: Memory.Size) Register {
+        return switch (size) {
+            .byte => reg.to8(),
+            .high_byte => reg.toHi(), // DELETE ME
+            .word => reg.to16(),
+            .dword => reg.to32(),
+            .qword => reg.to64(),
+            .tbyte => reg.to80(),
+            .xword => reg.to128(),
+            .yword => reg.to256(),
+            .zword => reg.to512(),
             else => unreachable,
         };
     }
@@ -567,6 +574,11 @@ pub const Register = enum(u8) {
         };
     }
 
+    pub fn to80(reg: Register) Register {
+        assert(reg.class() == .x87);
+        return reg;
+    }
+
     fn sseBase(reg: Register) u8 {
         assert(reg.class() == .sse);
         return switch (@intFromEnum(reg)) {
@@ -575,6 +587,10 @@ pub const Register = enum(u8) {
             @intFromEnum(Register.xmm0)...@intFromEnum(Register.xmm31) => @intFromEnum(Register.xmm0),
             else => unreachable,
         };
+    }
+
+    pub fn to512(reg: Register) Register {
+        return @enumFromInt(@intFromEnum(reg) - reg.sseBase() + @intFromEnum(Register.zmm0));
     }
 
     pub fn to256(reg: Register) Register {
@@ -711,6 +727,7 @@ pub const Memory = struct {
         ptr,
         gpr,
         byte,
+        high_byte,
         word,
         dword,
         qword,
@@ -755,7 +772,7 @@ pub const Memory = struct {
                     .x86 => 32,
                     .x86_64 => 64,
                 },
-                .byte => 8,
+                .byte, .high_byte => 8,
                 .word => 16,
                 .dword => 32,
                 .qword => 64,
