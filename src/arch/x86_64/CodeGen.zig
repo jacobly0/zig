@@ -6,6 +6,7 @@ const log = std.log.scoped(.codegen);
 const tracking_log = std.log.scoped(.tracking);
 const verbose_tracking_log = std.log.scoped(.verbose_tracking);
 const wip_mir_log = std.log.scoped(.wip_mir);
+const Writer = std.io.Writer;
 
 const Air = @import("../../Air.zig");
 const Allocator = std.mem.Allocator;
@@ -524,52 +525,47 @@ pub const MCValue = union(enum) {
         };
     }
 
-    pub fn format(
-        mcv: MCValue,
-        comptime _: []const u8,
-        _: std.fmt.FormatOptions,
-        writer: anytype,
-    ) @TypeOf(writer).Error!void {
+    pub fn format(mcv: MCValue, bw: *Writer, comptime _: []const u8) Writer.Error!void {
         switch (mcv) {
-            .none, .unreach, .dead, .undef => try writer.print("({s})", .{@tagName(mcv)}),
-            .immediate => |pl| try writer.print("0x{x}", .{pl}),
-            .memory => |pl| try writer.print("[ds:0x{x}]", .{pl}),
-            inline .eflags, .register => |pl| try writer.print("{s}", .{@tagName(pl)}),
-            .register_pair => |pl| try writer.print("{s}:{s}", .{ @tagName(pl[1]), @tagName(pl[0]) }),
-            .register_triple => |pl| try writer.print("{s}:{s}:{s}", .{
+            .none, .unreach, .dead, .undef => try bw.print("({s})", .{@tagName(mcv)}),
+            .immediate => |pl| try bw.print("0x{x}", .{pl}),
+            .memory => |pl| try bw.print("[ds:0x{x}]", .{pl}),
+            inline .eflags, .register => |pl| try bw.print("{s}", .{@tagName(pl)}),
+            .register_pair => |pl| try bw.print("{s}:{s}", .{ @tagName(pl[1]), @tagName(pl[0]) }),
+            .register_triple => |pl| try bw.print("{s}:{s}:{s}", .{
                 @tagName(pl[2]), @tagName(pl[1]), @tagName(pl[0]),
             }),
-            .register_quadruple => |pl| try writer.print("{s}:{s}:{s}:{s}", .{
+            .register_quadruple => |pl| try bw.print("{s}:{s}:{s}:{s}", .{
                 @tagName(pl[3]), @tagName(pl[2]), @tagName(pl[1]), @tagName(pl[0]),
             }),
-            .register_offset => |pl| try writer.print("{s} + 0x{x}", .{ @tagName(pl.reg), pl.off }),
-            .register_overflow => |pl| try writer.print("{s}:{s}", .{
+            .register_offset => |pl| try bw.print("{s} + 0x{x}", .{ @tagName(pl.reg), pl.off }),
+            .register_overflow => |pl| try bw.print("{s}:{s}", .{
                 @tagName(pl.eflags),
                 @tagName(pl.reg),
             }),
-            .register_mask => |pl| try writer.print("mask({s},{}):{c}{s}", .{
+            .register_mask => |pl| try bw.print("mask({s},{f}):{c}{s}", .{
                 @tagName(pl.info.kind),
                 pl.info.scalar,
                 @as(u8, if (pl.info.inverted) '!' else ' '),
                 @tagName(pl.reg),
             }),
-            .indirect => |pl| try writer.print("[{s} + 0x{x}]", .{ @tagName(pl.reg), pl.off }),
-            .indirect_load_frame => |pl| try writer.print("[[{} + 0x{x}]]", .{ pl.index, pl.off }),
-            .load_frame => |pl| try writer.print("[{} + 0x{x}]", .{ pl.index, pl.off }),
-            .lea_frame => |pl| try writer.print("{} + 0x{x}", .{ pl.index, pl.off }),
-            .load_nav => |pl| try writer.print("[nav:{d}]", .{@intFromEnum(pl)}),
-            .lea_nav => |pl| try writer.print("nav:{d}", .{@intFromEnum(pl)}),
-            .load_uav => |pl| try writer.print("[uav:{d}]", .{@intFromEnum(pl.val)}),
-            .lea_uav => |pl| try writer.print("uav:{d}", .{@intFromEnum(pl.val)}),
-            .load_lazy_sym => |pl| try writer.print("[lazy:{s}:{d}]", .{ @tagName(pl.kind), @intFromEnum(pl.ty) }),
-            .lea_lazy_sym => |pl| try writer.print("lazy:{s}:{d}", .{ @tagName(pl.kind), @intFromEnum(pl.ty) }),
-            .load_extern_func => |pl| try writer.print("[extern:{d}]", .{@intFromEnum(pl)}),
-            .lea_extern_func => |pl| try writer.print("extern:{d}", .{@intFromEnum(pl)}),
-            .elementwise_args => |pl| try writer.print("elementwise:{d}:[{} + 0x{x}]", .{
+            .indirect => |pl| try bw.print("[{s} + 0x{x}]", .{ @tagName(pl.reg), pl.off }),
+            .indirect_load_frame => |pl| try bw.print("[[{} + 0x{x}]]", .{ pl.index, pl.off }),
+            .load_frame => |pl| try bw.print("[{} + 0x{x}]", .{ pl.index, pl.off }),
+            .lea_frame => |pl| try bw.print("{} + 0x{x}", .{ pl.index, pl.off }),
+            .load_nav => |pl| try bw.print("[nav:{d}]", .{@intFromEnum(pl)}),
+            .lea_nav => |pl| try bw.print("nav:{d}", .{@intFromEnum(pl)}),
+            .load_uav => |pl| try bw.print("[uav:{d}]", .{@intFromEnum(pl.val)}),
+            .lea_uav => |pl| try bw.print("uav:{d}", .{@intFromEnum(pl.val)}),
+            .load_lazy_sym => |pl| try bw.print("[lazy:{s}:{d}]", .{ @tagName(pl.kind), @intFromEnum(pl.ty) }),
+            .lea_lazy_sym => |pl| try bw.print("lazy:{s}:{d}", .{ @tagName(pl.kind), @intFromEnum(pl.ty) }),
+            .load_extern_func => |pl| try bw.print("[extern:{d}]", .{@intFromEnum(pl)}),
+            .lea_extern_func => |pl| try bw.print("extern:{d}", .{@intFromEnum(pl)}),
+            .elementwise_args => |pl| try bw.print("elementwise:{d}:[{} + 0x{x}]", .{
                 pl.regs, pl.frame_index, pl.frame_off,
             }),
-            .reserved_frame => |pl| try writer.print("(dead:{})", .{pl}),
-            .air_ref => |pl| try writer.print("(air:0x{x})", .{@intFromEnum(pl)}),
+            .reserved_frame => |pl| try bw.print("(dead:{})", .{pl}),
+            .air_ref => |pl| try bw.print("(air:0x{x})", .{@intFromEnum(pl)}),
         }
     }
 };
@@ -639,7 +635,7 @@ const InstTracking = struct {
             .reserved_frame => |index| self.long = .{ .load_frame = .{ .index = index } },
             else => unreachable,
         }
-        tracking_log.debug("spill {} from {} to {}", .{ inst, self.short, self.long });
+        tracking_log.debug("spill {f} from {f} to {f}", .{ inst, self.short, self.long });
         try cg.genCopy(cg.typeOfIndex(inst), self.long, self.short, .{});
         for (self.short.getRegs()) |reg| if (reg.isClass(.x87)) try cg.asmRegister(.{ .f_, .free }, reg);
     }
@@ -672,7 +668,7 @@ const InstTracking = struct {
             else => {}, // TODO process stack allocation death
         }
         self.reuseFrame();
-        tracking_log.debug("{} => {} (spilled)", .{ inst, self.* });
+        tracking_log.debug("{f} => {f} (spilled)", .{ inst, self.* });
     }
 
     fn verifyMaterialize(self: InstTracking, target: InstTracking) void {
@@ -749,7 +745,7 @@ const InstTracking = struct {
             else => target.long,
         } else target.long;
         self.short = target.short;
-        tracking_log.debug("{} => {} (materialize)", .{ inst, self.* });
+        tracking_log.debug("{f} => {f} (materialize)", .{ inst, self.* });
     }
 
     fn resurrect(self: *InstTracking, function: *CodeGen, inst: Air.Inst.Index, scope_generation: u32) !void {
@@ -757,7 +753,7 @@ const InstTracking = struct {
             .dead => |die_generation| if (die_generation >= scope_generation) {
                 self.reuseFrame();
                 try function.getValue(self.short, inst);
-                tracking_log.debug("{} => {} (resurrect)", .{ inst, self.* });
+                tracking_log.debug("{f} => {f} (resurrect)", .{ inst, self.* });
             },
             else => {},
         }
@@ -768,7 +764,7 @@ const InstTracking = struct {
         try function.freeValue(self.short, opts);
         if (self.long == .none) self.long = self.short;
         self.short = .{ .dead = function.scope_generation };
-        tracking_log.debug("{} => {} (death)", .{ inst, self.* });
+        tracking_log.debug("{f} => {f} (death)", .{ inst, self.* });
     }
 
     fn reuse(
@@ -778,13 +774,13 @@ const InstTracking = struct {
         old_inst: Air.Inst.Index,
     ) void {
         self.short = .{ .dead = function.scope_generation };
-        tracking_log.debug("{?} => {} (reuse {})", .{ new_inst, self.*, old_inst });
+        tracking_log.debug("{?f} => {f} (reuse {f})", .{ new_inst, self.*, old_inst });
     }
 
     fn liveOut(self: *InstTracking, function: *CodeGen, inst: Air.Inst.Index) void {
         for (self.getRegs()) |reg| {
             if (function.register_manager.isRegFree(reg)) {
-                tracking_log.debug("{} => {} (live-out)", .{ inst, self.* });
+                tracking_log.debug("{f} => {f} (live-out)", .{ inst, self.* });
                 continue;
             }
 
@@ -812,18 +808,13 @@ const InstTracking = struct {
             // Perform side-effects of freeValue manually.
             function.register_manager.freeReg(reg);
 
-            tracking_log.debug("{} => {} (live-out {})", .{ inst, self.*, tracked_inst });
+            tracking_log.debug("{f} => {f} (live-out {f})", .{ inst, self.*, tracked_inst });
         }
     }
 
-    pub fn format(
-        tracking: InstTracking,
-        comptime _: []const u8,
-        _: std.fmt.FormatOptions,
-        writer: anytype,
-    ) @TypeOf(writer).Error!void {
-        if (!std.meta.eql(tracking.long, tracking.short)) try writer.print("|{}| ", .{tracking.long});
-        try writer.print("{}", .{tracking.short});
+    pub fn format(tracking: InstTracking, bw: *Writer, comptime _: []const u8) Writer.Error!void {
+        if (!std.meta.eql(tracking.long, tracking.short)) try bw.print("|{f}| ", .{tracking.long});
+        try bw.print("{f}", .{tracking.short});
     }
 };
 
@@ -939,7 +930,7 @@ pub fn generate(
         function.inst_tracking.putAssumeCapacityNoClobber(temp.toIndex(), .init(.none));
     }
 
-    wip_mir_log.debug("{}:", .{fmtNav(func.owner_nav, ip)});
+    wip_mir_log.debug("{f}:", .{fmtNav(func.owner_nav, ip)});
 
     try function.frame_allocs.resize(gpa, FrameIndex.named_count);
     function.frame_allocs.set(
@@ -1097,15 +1088,10 @@ const FormatNavData = struct {
     ip: *const InternPool,
     nav_index: InternPool.Nav.Index,
 };
-fn formatNav(
-    data: FormatNavData,
-    comptime _: []const u8,
-    _: std.fmt.FormatOptions,
-    writer: anytype,
-) @TypeOf(writer).Error!void {
-    try writer.print("{}", .{data.ip.getNav(data.nav_index).fqn.fmt(data.ip)});
+fn formatNav(data: FormatNavData, w: *Writer) Writer.Error!void {
+    try w.print("{f}", .{data.ip.getNav(data.nav_index).fqn.fmt(data.ip)});
 }
-fn fmtNav(nav_index: InternPool.Nav.Index, ip: *const InternPool) std.fmt.Formatter(formatNav) {
+fn fmtNav(nav_index: InternPool.Nav.Index, ip: *const InternPool) std.fmt.Formatter(FormatNavData, formatNav) {
     return .{ .data = .{
         .ip = ip,
         .nav_index = nav_index,
@@ -1116,15 +1102,14 @@ const FormatAirData = struct {
     self: *CodeGen,
     inst: Air.Inst.Index,
 };
-fn formatAir(
-    data: FormatAirData,
-    comptime _: []const u8,
-    _: std.fmt.FormatOptions,
-    writer: anytype,
-) @TypeOf(writer).Error!void {
-    data.self.air.dumpInst(data.inst, data.self.pt, data.self.liveness);
+fn formatAir(data: FormatAirData, w: *std.io.Writer) Writer.Error!void {
+    // not acceptable implementation because it ignores `w`:
+    //data.self.air.dumpInst(data.inst, data.self.pt, data.self.liveness);
+    _ = data;
+    _ = w;
+    @panic("TODO: unimplemented");
 }
-fn fmtAir(self: *CodeGen, inst: Air.Inst.Index) std.fmt.Formatter(formatAir) {
+fn fmtAir(self: *CodeGen, inst: Air.Inst.Index) std.fmt.Formatter(FormatAirData, formatAir) {
     return .{ .data = .{ .self = self, .inst = inst } };
 }
 
@@ -1132,12 +1117,7 @@ const FormatWipMirData = struct {
     self: *CodeGen,
     inst: Mir.Inst.Index,
 };
-fn formatWipMir(
-    data: FormatWipMirData,
-    comptime _: []const u8,
-    _: std.fmt.FormatOptions,
-    writer: anytype,
-) @TypeOf(writer).Error!void {
+fn formatWipMir(data: FormatWipMirData, w: *Writer) Writer.Error!void {
     var lower: Lower = .{
         .target = data.self.target,
         .allocator = data.self.gpa,
@@ -1152,11 +1132,11 @@ fn formatWipMir(
                 lower.err_msg.?.deinit(data.self.gpa);
                 lower.err_msg = null;
             }
-            try writer.writeAll(lower.err_msg.?.msg);
+            try w.writeAll(lower.err_msg.?.msg);
             return;
         },
         error.OutOfMemory, error.InvalidInstruction, error.CannotEncode => |e| {
-            try writer.writeAll(switch (e) {
+            try w.writeAll(switch (e) {
                 error.OutOfMemory => "Out of memory",
                 error.InvalidInstruction => "CodeGen failed to find a viable instruction.",
                 error.CannotEncode => "CodeGen failed to encode the instruction.",
@@ -1165,14 +1145,14 @@ fn formatWipMir(
         },
         else => |e| return e,
     }).insts) |lowered_inst| {
-        if (!first) try writer.writeAll("\ndebug(wip_mir): ");
-        try writer.print("  | {}", .{lowered_inst});
+        if (!first) try w.writeAll("\ndebug(wip_mir): ");
+        try w.print("  | {f}", .{lowered_inst});
         first = false;
     }
     if (first) {
         const ip = &data.self.pt.zcu.intern_pool;
         const mir_inst = lower.mir.instructions.get(data.inst);
-        try writer.print("  | .{s}", .{@tagName(mir_inst.ops)});
+        try w.print("  | .{s}", .{@tagName(mir_inst.ops)});
         switch (mir_inst.ops) {
             else => unreachable,
             .pseudo_dbg_prologue_end_none,
@@ -1184,20 +1164,20 @@ fn formatWipMir(
             .pseudo_dbg_var_none,
             .pseudo_dead_none,
             => {},
-            .pseudo_dbg_line_stmt_line_column, .pseudo_dbg_line_line_column => try writer.print(
+            .pseudo_dbg_line_stmt_line_column, .pseudo_dbg_line_line_column => try w.print(
                 " {[line]d}, {[column]d}",
                 mir_inst.data.line_column,
             ),
-            .pseudo_dbg_enter_inline_func, .pseudo_dbg_leave_inline_func => try writer.print(" {}", .{
+            .pseudo_dbg_enter_inline_func, .pseudo_dbg_leave_inline_func => try w.print(" {f}", .{
                 ip.getNav(ip.indexToKey(mir_inst.data.ip_index).func.owner_nav).name.fmt(ip),
             }),
-            .pseudo_dbg_arg_i_s, .pseudo_dbg_var_i_s => try writer.print(" {d}", .{
+            .pseudo_dbg_arg_i_s, .pseudo_dbg_var_i_s => try w.print(" {d}", .{
                 @as(i32, @bitCast(mir_inst.data.i.i)),
             }),
-            .pseudo_dbg_arg_i_u, .pseudo_dbg_var_i_u => try writer.print(" {d}", .{
+            .pseudo_dbg_arg_i_u, .pseudo_dbg_var_i_u => try w.print(" {d}", .{
                 mir_inst.data.i.i,
             }),
-            .pseudo_dbg_arg_i_64, .pseudo_dbg_var_i_64 => try writer.print(" {d}", .{
+            .pseudo_dbg_arg_i_64, .pseudo_dbg_var_i_64 => try w.print(" {d}", .{
                 mir_inst.data.i64,
             }),
             .pseudo_dbg_arg_ro, .pseudo_dbg_var_ro => {
@@ -1205,44 +1185,39 @@ fn formatWipMir(
                     .base = .{ .reg = mir_inst.data.ro.reg },
                     .disp = mir_inst.data.ro.off,
                 }) };
-                try writer.print(" {}", .{mem_op.fmt(.m)});
+                try w.print(" {f}", .{mem_op.fmt(.m)});
             },
             .pseudo_dbg_arg_fa, .pseudo_dbg_var_fa => {
                 const mem_op: encoder.Instruction.Operand = .{ .mem = .initSib(.qword, .{
                     .base = .{ .frame = mir_inst.data.fa.index },
                     .disp = mir_inst.data.fa.off,
                 }) };
-                try writer.print(" {}", .{mem_op.fmt(.m)});
+                try w.print(" {f}", .{mem_op.fmt(.m)});
             },
             .pseudo_dbg_arg_m, .pseudo_dbg_var_m => {
                 const mem_op: encoder.Instruction.Operand = .{
                     .mem = lower.mir.extraData(Mir.Memory, mir_inst.data.x.payload).data.decode(),
                 };
-                try writer.print(" {}", .{mem_op.fmt(.m)});
+                try w.print(" {f}", .{mem_op.fmt(.m)});
             },
-            .pseudo_dbg_arg_val, .pseudo_dbg_var_val => try writer.print(" {}", .{
+            .pseudo_dbg_arg_val, .pseudo_dbg_var_val => try w.print(" {}", .{
                 Value.fromInterned(mir_inst.data.ip_index).fmtValue(data.self.pt),
             }),
         }
     }
 }
-fn fmtWipMir(self: *CodeGen, inst: Mir.Inst.Index) std.fmt.Formatter(formatWipMir) {
+fn fmtWipMir(self: *CodeGen, inst: Mir.Inst.Index) std.fmt.Formatter(FormatWipMirData, formatWipMir) {
     return .{ .data = .{ .self = self, .inst = inst } };
 }
 
 const FormatTrackingData = struct {
     self: *CodeGen,
 };
-fn formatTracking(
-    data: FormatTrackingData,
-    comptime _: []const u8,
-    _: std.fmt.FormatOptions,
-    writer: anytype,
-) @TypeOf(writer).Error!void {
+fn formatTracking(data: FormatTrackingData, w: *Writer) Writer.Error!void {
     var it = data.self.inst_tracking.iterator();
-    while (it.next()) |entry| try writer.print("\n{} = {}", .{ entry.key_ptr.*, entry.value_ptr.* });
+    while (it.next()) |entry| try w.print("\n{f} = {f}", .{ entry.key_ptr.*, entry.value_ptr.* });
 }
-fn fmtTracking(self: *CodeGen) std.fmt.Formatter(formatTracking) {
+fn fmtTracking(self: *CodeGen) std.fmt.Formatter(FormatTrackingData, formatTracking) {
     return .{ .data = .{ .self = self } };
 }
 
@@ -1251,7 +1226,7 @@ fn addInst(self: *CodeGen, inst: Mir.Inst) error{OutOfMemory}!Mir.Inst.Index {
     try self.mir_instructions.ensureUnusedCapacity(gpa, 1);
     const result_index: Mir.Inst.Index = @intCast(self.mir_instructions.len);
     self.mir_instructions.appendAssumeCapacity(inst);
-    if (inst.ops != .pseudo_dead_none) wip_mir_log.debug("{}", .{self.fmtWipMir(result_index)});
+    if (inst.ops != .pseudo_dead_none) wip_mir_log.debug("{f}", .{self.fmtWipMir(result_index)});
     return result_index;
 }
 
@@ -2056,7 +2031,7 @@ fn gen(
                     .{},
                 );
                 self.ret_mcv.long = .{ .load_frame = .{ .index = frame_index } };
-                tracking_log.debug("spill {} to {}", .{ self.ret_mcv.long, frame_index });
+                tracking_log.debug("spill {f} to {f}", .{ self.ret_mcv.long, frame_index });
             },
             else => unreachable,
         }
@@ -2334,8 +2309,8 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
 
     for (body) |inst| {
         if (cg.liveness.isUnused(inst) and !cg.air.mustLower(inst, ip)) continue;
-        wip_mir_log.debug("{}", .{cg.fmtAir(inst)});
-        verbose_tracking_log.debug("{}", .{cg.fmtTracking()});
+        wip_mir_log.debug("{f}", .{cg.fmtAir(inst)});
+        verbose_tracking_log.debug("{f}", .{cg.fmtTracking()});
 
         cg.reused_operands = .initEmpty();
         try cg.inst_tracking.ensureUnusedCapacity(cg.gpa, 1);
@@ -4339,7 +4314,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nc, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(bin_op.lhs).fmt(pt),
                         ops[0].tracking(cg),
@@ -4351,7 +4326,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                     else => unreachable,
                     .add, .add_optimized => {},
                     .add_wrap => res[0].wrapInt(cg) catch |err| switch (err) {
-                        error.SelectFailed => return cg.fail("failed to select {s} wrap {} {}", .{
+                        error.SelectFailed => return cg.fail("failed to select {s} wrap {f} {f}", .{
                             @tagName(air_tag),
                             cg.typeOf(bin_op.lhs).fmt(pt),
                             res[0].tracking(cg),
@@ -14947,7 +14922,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nc, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(bin_op.lhs).fmt(pt),
                         ops[0].tracking(cg),
@@ -14959,7 +14934,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                     else => unreachable,
                     .sub, .sub_optimized => {},
                     .sub_wrap => res[0].wrapInt(cg) catch |err| switch (err) {
-                        error.SelectFailed => return cg.fail("failed to select {s} wrap {} {}", .{
+                        error.SelectFailed => return cg.fail("failed to select {s} wrap {f} {f}", .{
                             @tagName(air_tag),
                             cg.typeOf(bin_op.lhs).fmt(pt),
                             res[0].tracking(cg),
@@ -24587,7 +24562,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nc, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         ty.fmt(pt),
                         ops[0].tracking(cg),
@@ -27287,7 +27262,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nc, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         ty.fmt(pt),
                         ops[0].tracking(cg),
@@ -27296,7 +27271,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                     else => |e| return e,
                 };
                 res[0].wrapInt(cg) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} wrap {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} wrap {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(bin_op.lhs).fmt(pt),
                         res[0].tracking(cg),
@@ -33606,7 +33581,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                     assert(air_tag == .div_exact);
                     res[0] = ops[0].divTruncInts(&ops[1], cg) catch |err| break :err err;
                 }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         ty.fmt(pt),
                         ops[0].tracking(cg),
@@ -34837,7 +34812,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                 } }) else err: {
                     res[0] = ops[0].divTruncInts(&ops[1], cg) catch |err| break :err err;
                 }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         ty.fmt(pt),
                         ops[0].tracking(cg),
@@ -36148,7 +36123,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         } },
                     } },
                 }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(bin_op.lhs).fmt(pt),
                         ops[0].tracking(cg),
@@ -37614,7 +37589,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nc, .j, .@"0b", ._, ._, ._ },
                     } },
                 } })) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         ty.fmt(pt),
                         ops[0].tracking(cg),
@@ -39248,7 +39223,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nc, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(bin_op.lhs).fmt(pt),
                         ops[0].tracking(cg),
@@ -42077,7 +42052,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nc, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(bin_op.lhs).fmt(pt),
                         ops[0].tracking(cg),
@@ -42191,7 +42166,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .lea, .dst0p, .leai(.src0, .dst0), ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(bin_op.lhs).fmt(pt),
                         ops[0].tracking(cg),
@@ -42320,7 +42295,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .lea, .dst0p, .leai(.src0, .dst0), ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(bin_op.lhs).fmt(pt),
                         ops[0].tracking(cg),
@@ -46485,7 +46460,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nc, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(bin_op.lhs).fmt(pt),
                         ops[0].tracking(cg),
@@ -50644,7 +50619,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nc, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(bin_op.lhs).fmt(pt),
                         ops[0].tracking(cg),
@@ -51493,7 +51468,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .mov, .memad(.dst0q, .add_src0_size, -8), .tmp0q, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         ty_pl.ty.toType().fmt(pt),
                         ops[0].tracking(cg),
@@ -52398,7 +52373,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .mov, .memad(.dst0q, .add_src0_size, -8), .tmp0q, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         ty_pl.ty.toType().fmt(pt),
                         ops[0].tracking(cg),
@@ -55995,7 +55970,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .@"or", .tmp2q, .tmp1q, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         ty_pl.ty.toType().fmt(pt),
                         ops[0].tracking(cg),
@@ -59735,7 +59710,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         } },
                     } },
                 }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(bin_op.lhs).fmt(pt),
                         ops[0].tracking(cg),
@@ -60298,7 +60273,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nz, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(bin_op.lhs).fmt(pt),
                         cg.typeOf(bin_op.rhs).fmt(pt),
@@ -60660,7 +60635,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._ns, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(bin_op.lhs).fmt(pt),
                         cg.typeOf(bin_op.rhs).fmt(pt),
@@ -60672,7 +60647,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                 switch (air_tag) {
                     else => unreachable,
                     .shl => res[0].wrapInt(cg) catch |err| switch (err) {
-                        error.SelectFailed => return cg.fail("failed to select {s} wrap {} {}", .{
+                        error.SelectFailed => return cg.fail("failed to select {s} wrap {f} {f}", .{
                             @tagName(air_tag),
                             cg.typeOf(bin_op.lhs).fmt(pt),
                             res[0].tracking(cg),
@@ -65329,7 +65304,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._b, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f}", .{
                         @tagName(air_tag),
                         ty_op.ty.toType().fmt(pt),
                         ops[0].tracking(cg),
@@ -68483,7 +68458,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nc, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(ty_op.operand).fmt(pt),
                         ops[0].tracking(cg),
@@ -68880,7 +68855,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ .@"0:", ._, .lea, .dst0d, .leasia(.dst0, .@"8", .tmp0, .add_8_src0_size), ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(ty_op.operand).fmt(pt),
                         ops[0].tracking(cg),
@@ -69768,7 +69743,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._ae, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(ty_op.operand).fmt(pt),
                         ops[0].tracking(cg),
@@ -70417,7 +70392,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._ae, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f}", .{
                         @tagName(air_tag),
                         ty_op.ty.toType().fmt(pt),
                         ops[0].tracking(cg),
@@ -73519,7 +73494,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._ae, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f}", .{
                         @tagName(air_tag),
                         ty_op.ty.toType().fmt(pt),
                         ops[0].tracking(cg),
@@ -74457,7 +74432,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nc, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(un_op).fmt(pt),
                         ops[0].tracking(cg),
@@ -75183,7 +75158,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         } },
                     } },
                 }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(un_op).fmt(pt),
                         ops[0].tracking(cg),
@@ -76734,7 +76709,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nc, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(ty_op.operand).fmt(pt),
                         ops[0].tracking(cg),
@@ -77926,7 +77901,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         } },
                     } },
                 }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(un_op).fmt(pt),
                         ops[0].tracking(cg),
@@ -78466,7 +78441,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nc, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(un_op).fmt(pt),
                         ops[0].tracking(cg),
@@ -78913,7 +78888,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                 } else err: {
                     res[0] = ops[0].cmpInts(cmp_op, &ops[1], cg) catch |err| break :err err;
                 }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(bin_op.lhs).fmt(pt),
                         ops[0].tracking(cg),
@@ -79470,7 +79445,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         res[0] = ops[0].cmpInts(cmp_op, &ops[1], cg) catch |err| break :err err;
                     },
                 }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         ty.fmt(pt),
                         ops[0].tracking(cg),
@@ -88546,7 +88521,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._ae, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         ty_op.ty.toType().fmt(pt),
                         cg.typeOf(ty_op.operand).fmt(pt),
@@ -90221,7 +90196,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._ae, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         ty_op.ty.toType().fmt(pt),
                         cg.typeOf(ty_op.operand).fmt(pt),
@@ -94899,7 +94874,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nz, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         dst_ty.fmt(pt),
                         src_ty.fmt(pt),
@@ -100565,7 +100540,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nz, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         ty_op.ty.toType().fmt(pt),
                         cg.typeOf(ty_op.operand).fmt(pt),
@@ -111427,7 +111402,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._ae, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         ty_op.ty.toType().fmt(pt),
                         cg.typeOf(ty_op.operand).fmt(pt),
@@ -123446,7 +123421,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._ae, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         ty_op.ty.toType().fmt(pt),
                         cg.typeOf(ty_op.operand).fmt(pt),
@@ -166464,7 +166439,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .@"test", .src0p, .src0p, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(un_op).fmt(pt),
                         ops[0].tracking(cg),
@@ -166552,7 +166527,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .call, .tmp0d, ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(un_op).fmt(pt),
                         ops[0].tracking(cg),
@@ -166654,7 +166629,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .lea, .dst1d, .leai(.dst1, .tmp1), ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(un_op).fmt(pt),
                         ops[0].tracking(cg),
@@ -166752,7 +166727,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .@"test", .src0d, .src0d, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f}", .{
                         @tagName(air_tag),
                         ty_op.ty.toType().fmt(pt),
                         ops[0].tracking(cg),
@@ -166804,7 +166779,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                                     }
                                 }
                             },
-                            .@"packed" => return cg.fail("failed to select {s} {}", .{
+                            .@"packed" => return cg.fail("failed to select {s} {f}", .{
                                 @tagName(air_tag),
                                 agg_ty.fmt(pt),
                             }),
@@ -166825,7 +166800,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                             elem_disp += @intCast(field_type.abiSize(zcu));
                         }
                     },
-                    else => return cg.fail("failed to select {s} {}", .{
+                    else => return cg.fail("failed to select {s} {f}", .{
                         @tagName(air_tag),
                         agg_ty.fmt(pt),
                     }),
@@ -168123,7 +168098,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._ae, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(bin_op.lhs).fmt(pt),
                         ops[0].tracking(cg),
@@ -168223,7 +168198,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .cmp, .src0d, .lea(.tmp1d), ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f}", .{
                         @tagName(air_tag),
                         ops[0].tracking(cg),
                     }),
@@ -168242,12 +168217,12 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                     .ref => {
                         const result = try cg.allocRegOrMem(err_ret_trace_index, true);
                         try cg.genCopy(.usize, result, ops[0].tracking(cg).short, .{});
-                        tracking_log.debug("{} => {} (birth)", .{ err_ret_trace_index, result });
+                        tracking_log.debug("{f} => {f} (birth)", .{ err_ret_trace_index, result });
                         cg.inst_tracking.putAssumeCapacityNoClobber(err_ret_trace_index, .init(result));
                     },
                     .temp => |temp_index| {
                         const temp_tracking = temp_index.tracking(cg);
-                        tracking_log.debug("{} => {} (birth)", .{ err_ret_trace_index, temp_tracking.short });
+                        tracking_log.debug("{f} => {f} (birth)", .{ err_ret_trace_index, temp_tracking.short });
                         cg.inst_tracking.putAssumeCapacityNoClobber(err_ret_trace_index, temp_tracking.*);
                         assert(cg.reuseTemp(err_ret_trace_index, temp_index.toIndex(), temp_tracking));
                     },
@@ -168917,7 +168892,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
         try cg.resetTemps(@enumFromInt(0));
         cg.checkInvariantsAfterAirInst();
     }
-    verbose_tracking_log.debug("{}", .{cg.fmtTracking()});
+    verbose_tracking_log.debug("{f}", .{cg.fmtTracking()});
 }
 
 fn genLazy(cg: *CodeGen, lazy_sym: link.File.LazySymbol) InnerError!void {
@@ -168927,7 +168902,7 @@ fn genLazy(cg: *CodeGen, lazy_sym: link.File.LazySymbol) InnerError!void {
     switch (ip.indexToKey(lazy_sym.ty)) {
         .enum_type => {
             const enum_ty: Type = .fromInterned(lazy_sym.ty);
-            wip_mir_log.debug("{}.@tagName:", .{enum_ty.fmt(pt)});
+            wip_mir_log.debug("{f}.@tagName:", .{enum_ty.fmt(pt)});
 
             const param_regs = abi.getCAbiIntParamRegs(.auto);
             const param_locks = cg.register_manager.lockRegsAssumeUnused(2, param_regs[0..2].*);
@@ -168976,7 +168951,7 @@ fn genLazy(cg: *CodeGen, lazy_sym: link.File.LazySymbol) InnerError!void {
         },
         .error_set_type => |error_set_type| {
             const err_ty: Type = .fromInterned(lazy_sym.ty);
-            wip_mir_log.debug("{}.@errorCast:", .{err_ty.fmt(pt)});
+            wip_mir_log.debug("{f}.@errorCast:", .{err_ty.fmt(pt)});
 
             const param_regs = abi.getCAbiIntParamRegs(.auto);
             const param_locks = cg.register_manager.lockRegsAssumeUnused(2, param_regs[0..2].*);
@@ -169016,7 +168991,7 @@ fn genLazy(cg: *CodeGen, lazy_sym: link.File.LazySymbol) InnerError!void {
             try cg.asmOpOnly(.{ ._, .ret });
         },
         else => return cg.fail(
-            "TODO implement {s} for {}",
+            "TODO implement {s} for {f}",
             .{ @tagName(lazy_sym.kind), Type.fromInterned(lazy_sym.ty).fmt(pt) },
         ),
     }
@@ -169076,7 +169051,7 @@ fn finishAirResult(self: *CodeGen, inst: Air.Inst.Index, result: MCValue) void {
         .none, .dead, .unreach => {},
         else => unreachable, // Why didn't the result die?
     } else {
-        tracking_log.debug("{} => {} (birth)", .{ inst, result });
+        tracking_log.debug("{f} => {f} (birth)", .{ inst, result });
         self.inst_tracking.putAssumeCapacityNoClobber(inst, .init(result));
         // In some cases, an operand may be reused as the result.
         // If that operand died and was a register, it was freed by
@@ -169226,7 +169201,7 @@ fn allocMemPtr(self: *CodeGen, inst: Air.Inst.Index) !FrameIndex {
     const val_ty = ptr_ty.childType(zcu);
     return self.allocFrameIndex(.init(.{
         .size = std.math.cast(u32, val_ty.abiSize(zcu)) orelse {
-            return self.fail("type '{}' too big to fit into stack frame", .{val_ty.fmt(pt)});
+            return self.fail("type '{f}' too big to fit into stack frame", .{val_ty.fmt(pt)});
         },
         .alignment = ptr_ty.ptrAlignment(zcu).max(.@"1"),
     }));
@@ -169244,7 +169219,7 @@ fn allocRegOrMemAdvanced(self: *CodeGen, ty: Type, inst: ?Air.Inst.Index, reg_ok
     const pt = self.pt;
     const zcu = pt.zcu;
     const abi_size = std.math.cast(u32, ty.abiSize(zcu)) orelse {
-        return self.fail("type '{}' too big to fit into stack frame", .{ty.fmt(pt)});
+        return self.fail("type '{f}' too big to fit into stack frame", .{ty.fmt(pt)});
     };
 
     if (reg_ok) need_mem: {
@@ -169749,7 +169724,7 @@ fn airFpext(self: *CodeGen, inst: Air.Inst.Index) !void {
             );
         }
         break :result dst_mcv;
-    } orelse return self.fail("TODO implement airFpext from {} to {}", .{
+    } orelse return self.fail("TODO implement airFpext from {f} to {f}", .{
         src_ty.fmt(pt), dst_ty.fmt(pt),
     });
     return self.finishAir(inst, result, .{ ty_op.operand, .none, .none });
@@ -170004,7 +169979,7 @@ fn airIntCast(self: *CodeGen, inst: Air.Inst.Index) !void {
         );
 
         break :result dst_mcv;
-    }) orelse return self.fail("TODO implement airIntCast from {} to {}", .{
+    }) orelse return self.fail("TODO implement airIntCast from {f} to {f}", .{
         src_ty.fmt(pt), dst_ty.fmt(pt),
     });
     return self.finishAir(inst, result, .{ ty_op.operand, .none, .none });
@@ -170076,7 +170051,7 @@ fn airTrunc(self: *CodeGen, inst: Air.Inst.Index) !void {
                     else => null,
                 },
                 else => null,
-            }) orelse return self.fail("TODO implement airTrunc for {}", .{dst_ty.fmt(pt)});
+            }) orelse return self.fail("TODO implement airTrunc for {f}", .{dst_ty.fmt(pt)});
 
             const dst_info = dst_elem_ty.intInfo(zcu);
             const src_info = src_elem_ty.intInfo(zcu);
@@ -170497,7 +170472,7 @@ fn airAddSat(self: *CodeGen, inst: Air.Inst.Index) !void {
     const bin_op = self.air.instructions.items(.data)[@intFromEnum(inst)].bin_op;
     const ty = self.typeOf(bin_op.lhs);
     if (ty.zigTypeTag(zcu) == .vector or ty.abiSize(zcu) > 8) return self.fail(
-        "TODO implement airAddSat for {}",
+        "TODO implement airAddSat for {f}",
         .{ty.fmt(pt)},
     );
 
@@ -170575,7 +170550,7 @@ fn airSubSat(self: *CodeGen, inst: Air.Inst.Index) !void {
     const bin_op = self.air.instructions.items(.data)[@intFromEnum(inst)].bin_op;
     const ty = self.typeOf(bin_op.lhs);
     if (ty.zigTypeTag(zcu) == .vector or ty.abiSize(zcu) > 8) return self.fail(
-        "TODO implement airSubSat for {}",
+        "TODO implement airSubSat for {f}",
         .{ty.fmt(pt)},
     );
 
@@ -170726,7 +170701,7 @@ fn airMulSat(self: *CodeGen, inst: Air.Inst.Index) !void {
         }
 
         if (ty.zigTypeTag(zcu) == .vector or ty.abiSize(zcu) > 8) return self.fail(
-            "TODO implement airMulSat for {}",
+            "TODO implement airMulSat for {f}",
             .{ty.fmt(pt)},
         );
 
@@ -171020,7 +170995,7 @@ fn airMulWithOverflow(self: *CodeGen, inst: Air.Inst.Index) !void {
     const tuple_ty = self.typeOfIndex(inst);
     const dst_ty = self.typeOf(bin_op.lhs);
     const result: MCValue = switch (dst_ty.zigTypeTag(zcu)) {
-        .vector => return self.fail("TODO implement airMulWithOverflow for {}", .{dst_ty.fmt(pt)}),
+        .vector => return self.fail("TODO implement airMulWithOverflow for {f}", .{dst_ty.fmt(pt)}),
         .int => result: {
             const dst_info = dst_ty.intInfo(zcu);
             if (dst_info.bits > 128 and dst_info.signedness == .unsigned) {
@@ -171373,7 +171348,7 @@ fn airMulWithOverflow(self: *CodeGen, inst: Air.Inst.Index) !void {
                 else => {
                     // For now, this is the only supported multiply that doesn't fit in a register.
                     if (dst_info.bits > 128 or src_bits != 64)
-                        return self.fail("TODO implement airWithOverflow from {} to {}", .{
+                        return self.fail("TODO implement airWithOverflow from {f} to {f}", .{
                             src_ty.fmt(pt), dst_ty.fmt(pt),
                         });
 
@@ -171774,7 +171749,7 @@ fn airShlShrBinOp(self: *CodeGen, inst: Air.Inst.Index) !void {
             },
             else => {},
         }
-        return self.fail("TODO implement airShlShrBinOp for {}", .{lhs_ty.fmt(pt)});
+        return self.fail("TODO implement airShlShrBinOp for {f}", .{lhs_ty.fmt(pt)});
     };
     return self.finishAir(inst, result, .{ bin_op.lhs, bin_op.rhs, .none });
 }
@@ -172034,7 +172009,7 @@ fn airUnwrapErrUnionErr(self: *CodeGen, inst: Air.Inst.Index) !void {
                 .index = frame_addr.index,
                 .off = frame_addr.off + @as(i32, @intCast(err_off)),
             } },
-            else => return self.fail("TODO implement unwrap_err_err for {}", .{operand}),
+            else => return self.fail("TODO implement unwrap_err_err for {f}", .{operand}),
         }
     };
     return self.finishAir(inst, result, .{ ty_op.operand, .none, .none });
@@ -172196,7 +172171,7 @@ fn genUnwrapErrUnionPayloadMir(
                 else
                     .{ .register = try self.copyToTmpRegister(payload_ty, result_mcv) };
             },
-            else => return self.fail("TODO implement genUnwrapErrUnionPayloadMir for {}", .{err_union}),
+            else => return self.fail("TODO implement genUnwrapErrUnionPayloadMir for {f}", .{err_union}),
         }
     };
 
@@ -172362,7 +172337,7 @@ fn airSliceLen(self: *CodeGen, inst: Air.Inst.Index) !void {
                 .index = frame_addr.index,
                 .off = frame_addr.off + 8,
             } },
-            else => return self.fail("TODO implement slice_len for {}", .{src_mcv}),
+            else => return self.fail("TODO implement slice_len for {f}", .{src_mcv}),
         };
         if (self.reuseOperand(inst, ty_op.operand, 0, src_mcv)) {
             switch (src_mcv) {
@@ -172645,7 +172620,7 @@ fn airArrayElemVal(self: *CodeGen, inst: Air.Inst.Index) !void {
                         }.to64(),
                     ),
                 },
-                else => return self.fail("TODO airArrayElemVal for {s} of {}", .{
+                else => return self.fail("TODO airArrayElemVal for {s} of {f}", .{
                     @tagName(array_mat_mcv), array_ty.fmt(pt),
                 }),
             }
@@ -172688,7 +172663,7 @@ fn airArrayElemVal(self: *CodeGen, inst: Air.Inst.Index) !void {
             .load_extern_func,
             .lea_extern_func,
             => try self.genSetReg(addr_reg, .usize, array_mcv.address(), .{}),
-            else => return self.fail("TODO airArrayElemVal_val for {s} of {}", .{
+            else => return self.fail("TODO airArrayElemVal_val for {s} of {f}", .{
                 @tagName(array_mcv), array_ty.fmt(pt),
             }),
         }
@@ -172881,7 +172856,7 @@ fn airGetUnionTag(self: *CodeGen, inst: Air.Inst.Index) !void {
                 }
 
                 return self.fail(
-                    "TODO implement get_union_tag for ABI larger than 8 bytes and operand {}",
+                    "TODO implement get_union_tag for ABI larger than 8 bytes and operand {f}",
                     .{operand},
                 );
             },
@@ -172893,7 +172868,7 @@ fn airGetUnionTag(self: *CodeGen, inst: Air.Inst.Index) !void {
                     .register = registerAlias(result.register, @intCast(layout.tag_size)),
                 };
             },
-            else => return self.fail("TODO implement get_union_tag for {}", .{operand}),
+            else => return self.fail("TODO implement get_union_tag for {f}", .{operand}),
         }
     };
 
@@ -172909,7 +172884,7 @@ fn airClz(self: *CodeGen, inst: Air.Inst.Index) !void {
 
         const dst_ty = self.typeOfIndex(inst);
         const src_ty = self.typeOf(ty_op.operand);
-        if (src_ty.zigTypeTag(zcu) == .vector) return self.fail("TODO implement airClz for {}", .{
+        if (src_ty.zigTypeTag(zcu) == .vector) return self.fail("TODO implement airClz for {f}", .{
             src_ty.fmt(pt),
         });
 
@@ -173105,7 +173080,7 @@ fn airCtz(self: *CodeGen, inst: Air.Inst.Index) !void {
 
         const dst_ty = self.typeOfIndex(inst);
         const src_ty = self.typeOf(ty_op.operand);
-        if (src_ty.zigTypeTag(zcu) == .vector) return self.fail("TODO implement airCtz for {}", .{
+        if (src_ty.zigTypeTag(zcu) == .vector) return self.fail("TODO implement airCtz for {f}", .{
             src_ty.fmt(pt),
         });
 
@@ -173277,7 +173252,7 @@ fn airPopCount(self: *CodeGen, inst: Air.Inst.Index) !void {
         const src_ty = self.typeOf(ty_op.operand);
         const src_abi_size: u32 = @intCast(src_ty.abiSize(zcu));
         if (src_ty.zigTypeTag(zcu) == .vector or src_abi_size > 16)
-            return self.fail("TODO implement airPopCount for {}", .{src_ty.fmt(pt)});
+            return self.fail("TODO implement airPopCount for {f}", .{src_ty.fmt(pt)});
         const src_mcv = try self.resolveInst(ty_op.operand);
 
         const mat_src_mcv = switch (src_mcv) {
@@ -173430,7 +173405,7 @@ fn genByteSwap(
     const has_movbe = self.hasFeature(.movbe);
 
     if (src_ty.zigTypeTag(zcu) == .vector) return self.fail(
-        "TODO implement genByteSwap for {}",
+        "TODO implement genByteSwap for {f}",
         .{src_ty.fmt(pt)},
     );
 
@@ -173739,7 +173714,7 @@ fn floatSign(self: *CodeGen, inst: Air.Inst.Index, tag: Air.Inst.Tag, operand: A
     const result = result: {
         const scalar_bits = ty.scalarType(zcu).floatBits(self.target);
         if (scalar_bits == 80) {
-            if (ty.zigTypeTag(zcu) != .float) return self.fail("TODO implement floatSign for {}", .{
+            if (ty.zigTypeTag(zcu) != .float) return self.fail("TODO implement floatSign for {f}", .{
                 ty.fmt(pt),
             });
 
@@ -173763,7 +173738,7 @@ fn floatSign(self: *CodeGen, inst: Air.Inst.Index, tag: Air.Inst.Tag, operand: A
         const abi_size: u32 = switch (ty.abiSize(zcu)) {
             1...16 => 16,
             17...32 => 32,
-            else => return self.fail("TODO implement floatSign for {}", .{
+            else => return self.fail("TODO implement floatSign for {f}", .{
                 ty.fmt(pt),
             }),
         };
@@ -173822,7 +173797,7 @@ fn floatSign(self: *CodeGen, inst: Air.Inst.Index, tag: Air.Inst.Tag, operand: A
                     .abs => .{ .v_pd, .@"and" },
                     else => unreachable,
                 },
-                80 => return self.fail("TODO implement floatSign for {}", .{ty.fmt(pt)}),
+                80 => return self.fail("TODO implement floatSign for {f}", .{ty.fmt(pt)}),
                 else => unreachable,
             },
             registerAlias(dst_reg, abi_size),
@@ -173848,7 +173823,7 @@ fn floatSign(self: *CodeGen, inst: Air.Inst.Index, tag: Air.Inst.Tag, operand: A
                     .abs => .{ ._pd, .@"and" },
                     else => unreachable,
                 },
-                80 => return self.fail("TODO implement floatSign for {}", .{ty.fmt(pt)}),
+                80 => return self.fail("TODO implement floatSign for {f}", .{ty.fmt(pt)}),
                 else => unreachable,
             },
             registerAlias(dst_reg, abi_size),
@@ -173928,7 +173903,7 @@ fn genRoundLibcall(self: *CodeGen, ty: Type, src_mcv: MCValue, mode: bits.RoundM
     if (self.getRoundTag(ty)) |_| return .none;
 
     if (ty.zigTypeTag(zcu) != .float)
-        return self.fail("TODO implement genRound for {}", .{ty.fmt(pt)});
+        return self.fail("TODO implement genRound for {f}", .{ty.fmt(pt)});
 
     var sym_buf: ["__trunc?".len]u8 = undefined;
     return try self.genCall(.{ .extern_func = .{
@@ -174164,7 +174139,7 @@ fn airAbs(self: *CodeGen, inst: Air.Inst.Index) !void {
                 },
                 .float => return self.floatSign(inst, .abs, ty_op.operand, ty),
             },
-        }) orelse return self.fail("TODO implement airAbs for {}", .{ty.fmt(pt)});
+        }) orelse return self.fail("TODO implement airAbs for {f}", .{ty.fmt(pt)});
 
         const abi_size: u32 = @intCast(ty.abiSize(zcu));
         const src_mcv = try self.resolveInst(ty_op.operand);
@@ -174323,7 +174298,7 @@ fn airSqrt(self: *CodeGen, inst: Air.Inst.Index) !void {
                 else => unreachable,
             },
             else => unreachable,
-        }) orelse return self.fail("TODO implement airSqrt for {}", .{ty.fmt(pt)});
+        }) orelse return self.fail("TODO implement airSqrt for {f}", .{ty.fmt(pt)});
         switch (mir_tag[0]) {
             .v_ss, .v_sd => if (src_mcv.isBase()) try self.asmRegisterRegisterMemory(
                 mir_tag,
@@ -174481,7 +174456,7 @@ fn packedLoad(self: *CodeGen, dst_mcv: MCValue, ptr_ty: Type, ptr_mcv: MCValue) 
         return;
     }
 
-    if (val_abi_size > 8) return self.fail("TODO implement packed load of {}", .{val_ty.fmt(pt)});
+    if (val_abi_size > 8) return self.fail("TODO implement packed load of {f}", .{val_ty.fmt(pt)});
 
     const limb_abi_size: u31 = @min(val_abi_size, 8);
     const limb_abi_bits = limb_abi_size * 8;
@@ -174753,7 +174728,7 @@ fn packedStore(self: *CodeGen, ptr_ty: Type, ptr_mcv: MCValue, src_mcv: MCValue)
                 limb_mem,
                 registerAlias(tmp_reg, limb_abi_size),
             );
-        } else return self.fail("TODO: implement packed store of {}", .{src_ty.fmt(pt)});
+        } else return self.fail("TODO: implement packed store of {f}", .{src_ty.fmt(pt)});
     }
 }
 
@@ -174856,7 +174831,7 @@ fn genUnOp(self: *CodeGen, maybe_inst: ?Air.Inst.Index, tag: Air.Inst.Tag, src_a
     const zcu = pt.zcu;
     const src_ty = self.typeOf(src_air);
     if (src_ty.zigTypeTag(zcu) == .vector)
-        return self.fail("TODO implement genUnOp for {}", .{src_ty.fmt(pt)});
+        return self.fail("TODO implement genUnOp for {f}", .{src_ty.fmt(pt)});
 
     var src_mcv = try self.resolveInst(src_air);
     switch (src_mcv) {
@@ -174943,7 +174918,7 @@ fn genUnOp(self: *CodeGen, maybe_inst: ?Air.Inst.Index, tag: Air.Inst.Tag, src_a
 fn genUnOpMir(self: *CodeGen, mir_tag: Mir.Inst.FixedTag, dst_ty: Type, dst_mcv: MCValue) !void {
     const pt = self.pt;
     const abi_size: u32 = @intCast(dst_ty.abiSize(pt.zcu));
-    if (abi_size > 8) return self.fail("TODO implement {} for {}", .{ mir_tag, dst_ty.fmt(pt) });
+    if (abi_size > 8) return self.fail("TODO implement {} for {f}", .{ mir_tag, dst_ty.fmt(pt) });
     switch (dst_mcv) {
         .none,
         .unreach,
@@ -175672,7 +175647,7 @@ fn genBinOp(
                 },
                 floatLibcAbiSuffix(lhs_ty),
             }),
-            else => return self.fail("TODO implement genBinOp for {s} {}", .{
+            else => return self.fail("TODO implement genBinOp for {s} {f}", .{
                 @tagName(air_tag), lhs_ty.fmt(pt),
             }),
         } catch unreachable;
@@ -175785,7 +175760,7 @@ fn genBinOp(
                         );
                         break :adjusted .{ .register = dst_reg };
                     },
-                    80, 128 => return self.fail("TODO implement genBinOp for {s} of {}", .{
+                    80, 128 => return self.fail("TODO implement genBinOp for {s} of {f}", .{
                         @tagName(air_tag), lhs_ty.fmt(pt),
                     }),
                     else => unreachable,
@@ -175819,7 +175794,7 @@ fn genBinOp(
     if (sse_op and ((lhs_ty.scalarType(zcu).isRuntimeFloat() and
         lhs_ty.scalarType(zcu).floatBits(self.target) == 80) or
         lhs_ty.abiSize(zcu) > self.vectorSize(.float)))
-        return self.fail("TODO implement genBinOp for {s} {}", .{ @tagName(air_tag), lhs_ty.fmt(pt) });
+        return self.fail("TODO implement genBinOp for {s} {f}", .{ @tagName(air_tag), lhs_ty.fmt(pt) });
 
     const maybe_mask_reg = switch (air_tag) {
         else => null,
@@ -176199,7 +176174,7 @@ fn genBinOp(
                 }
             },
 
-            else => return self.fail("TODO implement genBinOp for {s} {}", .{
+            else => return self.fail("TODO implement genBinOp for {s} {f}", .{
                 @tagName(air_tag), lhs_ty.fmt(pt),
             }),
         }
@@ -176953,7 +176928,7 @@ fn genBinOp(
                 else => unreachable,
             },
         },
-    }) orelse return self.fail("TODO implement genBinOp for {s} {}", .{
+    }) orelse return self.fail("TODO implement genBinOp for {s} {f}", .{
         @tagName(air_tag), lhs_ty.fmt(pt),
     });
 
@@ -177086,7 +177061,7 @@ fn genBinOp(
                         else => unreachable,
                     },
                     else => unreachable,
-                }) orelse return self.fail("TODO implement genBinOp for {s} {}", .{
+                }) orelse return self.fail("TODO implement genBinOp for {s} {f}", .{
                     @tagName(air_tag), lhs_ty.fmt(pt),
                 }),
                 mask_reg,
@@ -177118,7 +177093,7 @@ fn genBinOp(
                         else => unreachable,
                     },
                     else => unreachable,
-                }) orelse return self.fail("TODO implement genBinOp for {s} {}", .{
+                }) orelse return self.fail("TODO implement genBinOp for {s} {f}", .{
                     @tagName(air_tag), lhs_ty.fmt(pt),
                 }),
                 dst_reg,
@@ -177154,7 +177129,7 @@ fn genBinOp(
                         else => unreachable,
                     },
                     else => unreachable,
-                }) orelse return self.fail("TODO implement genBinOp for {s} {}", .{
+                }) orelse return self.fail("TODO implement genBinOp for {s} {f}", .{
                     @tagName(air_tag), lhs_ty.fmt(pt),
                 }),
                 mask_reg,
@@ -177185,7 +177160,7 @@ fn genBinOp(
                         else => unreachable,
                     },
                     else => unreachable,
-                }) orelse return self.fail("TODO implement genBinOp for {s} {}", .{
+                }) orelse return self.fail("TODO implement genBinOp for {s} {f}", .{
                     @tagName(air_tag), lhs_ty.fmt(pt),
                 }),
                 dst_reg,
@@ -177215,7 +177190,7 @@ fn genBinOp(
                         else => unreachable,
                     },
                     else => unreachable,
-                }) orelse return self.fail("TODO implement genBinOp for {s} {}", .{
+                }) orelse return self.fail("TODO implement genBinOp for {s} {f}", .{
                     @tagName(air_tag), lhs_ty.fmt(pt),
                 });
                 try self.asmRegisterRegister(.{ mir_fixes, .@"and" }, dst_reg, mask_reg);
@@ -178022,7 +177997,7 @@ fn airArg(self: *CodeGen, inst: Air.Inst.Index) !void {
 
                 break :result dst_mcv;
             },
-            else => return self.fail("TODO implement arg for {}", .{src_mcv}),
+            else => return self.fail("TODO implement arg for {f}", .{src_mcv}),
         }
     };
     return self.finishAir(inst, result, .{ .none, .none, .none });
@@ -179079,7 +179054,7 @@ fn genCondBrMir(self: *CodeGen, ty: Type, mcv: MCValue) !Mir.Inst.Index {
                 const reg = try self.copyToTmpRegister(ty, mcv);
                 return self.genCondBrMir(ty, .{ .register = reg });
             }
-            return self.fail("TODO implement condbr when condition is {} with abi larger than 8 bytes", .{mcv});
+            return self.fail("TODO implement condbr when condition is {f} with abi larger than 8 bytes", .{mcv});
         },
         else => return self.fail("TODO implement condbr when condition is {s}", .{@tagName(mcv)}),
     }
@@ -179166,7 +179141,7 @@ fn isErr(self: *CodeGen, maybe_inst: ?Air.Inst.Index, eu_ty: Type, eu_mcv: MCVal
             } },
             .{ .immediate = 0 },
         ),
-        else => return self.fail("TODO implement isErr for {}", .{eu_mcv}),
+        else => return self.fail("TODO implement isErr for {f}", .{eu_mcv}),
     }
 
     if (maybe_inst) |inst| self.eflags_inst = inst;
@@ -180916,7 +180891,7 @@ fn moveStrategy(cg: *CodeGen, ty: Type, class: Register.Class, aligned: bool) !M
         },
         .ip, .cr, .dr => {},
     }
-    return cg.fail("TODO moveStrategy for {}", .{ty.fmt(pt)});
+    return cg.fail("TODO moveStrategy for {f}", .{ty.fmt(pt)});
 }
 
 const CopyOptions = struct {
@@ -181048,7 +181023,7 @@ fn genCopy(self: *CodeGen, ty: Type, dst_mcv: MCValue, src_mcv: MCValue, opts: C
                     break :src_info .{ .addr_reg = src_addr_reg, .addr_lock = src_addr_lock };
                 },
                 .air_ref => |src_ref| return self.genCopy(ty, dst_mcv, try self.resolveInst(src_ref), opts),
-                else => return self.fail("TODO implement genCopy for {s} of {}", .{
+                else => return self.fail("TODO implement genCopy for {s} of {f}", .{
                     @tagName(src_mcv), ty.fmt(pt),
                 }),
             };
@@ -181424,7 +181399,7 @@ fn genSetReg(
                             80 => null,
                             else => unreachable,
                         },
-                    }) orelse return self.fail("TODO implement genSetReg for {}", .{ty.fmt(pt)}),
+                    }) orelse return self.fail("TODO implement genSetReg for {f}", .{ty.fmt(pt)}),
                     dst_alias,
                     registerAlias(src_reg, abi_size),
                 ),
@@ -181854,7 +181829,7 @@ fn genSetMem(
                     opts,
                 );
             },
-            else => return self.fail("TODO implement genSetMem for {s} of {}", .{
+            else => return self.fail("TODO implement genSetMem for {s} of {f}", .{
                 @tagName(src_mcv), ty.fmt(pt),
             }),
         },
@@ -182167,7 +182142,7 @@ fn airFloatFromInt(self: *CodeGen, inst: Air.Inst.Index) !void {
             32, 64 => src_size > 8,
             else => unreachable,
         }) {
-            if (src_bits > 128) return self.fail("TODO implement airFloatFromInt from {} to {}", .{
+            if (src_bits > 128) return self.fail("TODO implement airFloatFromInt from {f} to {f}", .{
                 src_ty.fmt(pt), dst_ty.fmt(pt),
             });
 
@@ -182209,7 +182184,7 @@ fn airFloatFromInt(self: *CodeGen, inst: Air.Inst.Index) !void {
                 else => unreachable,
             },
             else => null,
-        }) orelse return self.fail("TODO implement airFloatFromInt from {} to {}", .{
+        }) orelse return self.fail("TODO implement airFloatFromInt from {f} to {f}", .{
             src_ty.fmt(pt), dst_ty.fmt(pt),
         });
         const dst_alias = dst_reg.to128();
@@ -182247,7 +182222,7 @@ fn airIntFromFloat(self: *CodeGen, inst: Air.Inst.Index) !void {
             32, 64 => dst_size > 8,
             else => unreachable,
         }) {
-            if (dst_bits > 128) return self.fail("TODO implement airIntFromFloat from {} to {}", .{
+            if (dst_bits > 128) return self.fail("TODO implement airIntFromFloat from {f} to {f}", .{
                 src_ty.fmt(pt), dst_ty.fmt(pt),
             });
 
@@ -182531,7 +182506,7 @@ fn atomicOp(
                         else => null,
                     },
                     else => unreachable,
-                }) orelse return self.fail("TODO implement atomicOp of {s} for {}", .{
+                }) orelse return self.fail("TODO implement atomicOp of {s} for {f}", .{
                     @tagName(op), val_ty.fmt(pt),
                 });
                 try self.genSetReg(sse_reg, val_ty, .{ .register = .rax }, .{});
@@ -183286,7 +183261,7 @@ fn airSplat(self: *CodeGen, inst: Air.Inst.Index) !void {
                 else => unreachable,
             },
         }
-        return self.fail("TODO implement airSplat for {}", .{vector_ty.fmt(pt)});
+        return self.fail("TODO implement airSplat for {f}", .{vector_ty.fmt(pt)});
     };
     return self.finishAir(inst, result, .{ ty_op.operand, .none, .none });
 }
@@ -183322,12 +183297,12 @@ fn airSelect(self: *CodeGen, inst: Air.Inst.Index) !void {
                         else
                             try self.copyToTmpRegister(pred_ty, pred_mcv)
                     else
-                        return self.fail("TODO implement airSelect for {}", .{ty.fmt(pt)}),
+                        return self.fail("TODO implement airSelect for {f}", .{ty.fmt(pt)}),
                     else => unreachable,
                 },
                 .register_mask => |pred_reg_mask| {
                     if (pred_reg_mask.info.scalar.bitSize(self.target) != 8 * elem_abi_size)
-                        return self.fail("TODO implement airSelect for {}", .{ty.fmt(pt)});
+                        return self.fail("TODO implement airSelect for {f}", .{ty.fmt(pt)});
 
                     const mask_reg: Register = if (need_xmm0 and pred_reg_mask.reg.id() != comptime Register.xmm0.id()) mask_reg: {
                         try self.register_manager.getKnownReg(.xmm0, null);
@@ -183401,7 +183376,7 @@ fn airSelect(self: *CodeGen, inst: Air.Inst.Index) !void {
                         else
                             null
                     else
-                        null) orelse return self.fail("TODO implement airSelect for {}", .{ty.fmt(pt)});
+                        null) orelse return self.fail("TODO implement airSelect for {f}", .{ty.fmt(pt)});
                     if (has_avx) {
                         const rhs_alias = if (reuse_mcv.isRegister())
                             registerAlias(reuse_mcv.getReg().?, abi_size)
@@ -183554,7 +183529,7 @@ fn airSelect(self: *CodeGen, inst: Air.Inst.Index) !void {
                         else => unreachable,
                     }),
                 );
-            } else return self.fail("TODO implement airSelect for {}", .{ty.fmt(pt)});
+            } else return self.fail("TODO implement airSelect for {f}", .{ty.fmt(pt)});
             const elem_bits: u16 = @intCast(elem_abi_size * 8);
             if (!pred_fits_in_elem) if (self.hasFeature(.ssse3)) {
                 const mask_len = elem_abi_size * vec_len;
@@ -183583,7 +183558,7 @@ fn airSelect(self: *CodeGen, inst: Air.Inst.Index) !void {
                     mask_alias,
                     mask_mem,
                 );
-            } else return self.fail("TODO implement airSelect for {}", .{ty.fmt(pt)});
+            } else return self.fail("TODO implement airSelect for {f}", .{ty.fmt(pt)});
             {
                 const mask_elem_ty = try pt.intType(.unsigned, elem_bits);
                 const mask_ty = try pt.vectorType(.{ .len = vec_len, .child = mask_elem_ty.toIntern() });
@@ -183706,7 +183681,7 @@ fn airSelect(self: *CodeGen, inst: Air.Inst.Index) !void {
                     else => null,
                 },
             },
-        }) orelse return self.fail("TODO implement airSelect for {}", .{ty.fmt(pt)});
+        }) orelse return self.fail("TODO implement airSelect for {f}", .{ty.fmt(pt)});
         if (has_avx) {
             const rhs_alias = if (rhs_mcv.isRegister())
                 registerAlias(rhs_mcv.getReg().?, abi_size)
@@ -184551,7 +184526,7 @@ fn airShuffle(self: *CodeGen, inst: Air.Inst.Index) !void {
         }
 
         break :result null;
-    }) orelse return self.fail("TODO implement airShuffle from {} and {} to {} with {}", .{
+    }) orelse return self.fail("TODO implement airShuffle from {f} and {f} to {f} with {f}", .{
         lhs_ty.fmt(pt),
         rhs_ty.fmt(pt),
         dst_ty.fmt(pt),
@@ -184800,7 +184775,7 @@ fn airMulAdd(self: *CodeGen, inst: Air.Inst.Index) !void {
             32, 64 => !self.hasFeature(.fma),
             else => unreachable,
         }) {
-            if (ty.zigTypeTag(zcu) != .float) return self.fail("TODO implement airMulAdd for {}", .{
+            if (ty.zigTypeTag(zcu) != .float) return self.fail("TODO implement airMulAdd for {f}", .{
                 ty.fmt(pt),
             });
 
@@ -184930,7 +184905,7 @@ fn airMulAdd(self: *CodeGen, inst: Air.Inst.Index) !void {
                 else => unreachable,
             }
         else
-            unreachable) orelse return self.fail("TODO implement airMulAdd for {}", .{ty.fmt(pt)});
+            unreachable) orelse return self.fail("TODO implement airMulAdd for {f}", .{ty.fmt(pt)});
 
         var mops: [3]MCValue = undefined;
         for (order, mcvs) |mop_index, mcv| mops[mop_index - 1] = mcv;
@@ -185130,7 +185105,7 @@ fn airVaArg(self: *CodeGen, inst: Air.Inst.Index) !void {
                     assert(classes.len == 1);
                     unreachable;
                 },
-                else => return self.fail("TODO implement c_va_arg for {} on SysV", .{promote_ty.fmt(pt)}),
+                else => return self.fail("TODO implement c_va_arg for {f} on SysV", .{promote_ty.fmt(pt)}),
             }
 
             if (unused) break :result .unreach;
@@ -185779,7 +185754,7 @@ fn splitType(self: *CodeGen, comptime parts_len: usize, ty: Type) ![parts_len]Ty
         for (parts) |part| part_sizes += part.abiSize(zcu);
         if (part_sizes == ty.abiSize(zcu)) return parts;
     };
-    return self.fail("TODO implement splitType({d}, {})", .{ parts_len, ty.fmt(pt) });
+    return self.fail("TODO implement splitType({d}, {f})", .{ parts_len, ty.fmt(pt) });
 }
 
 /// Truncates the value in the register in place.
@@ -186153,7 +186128,7 @@ const Temp = struct {
         cg.next_temp_index = @enumFromInt(@intFromEnum(new_temp_index) + 1);
         const mcv = temp.tracking(cg).short;
         switch (mcv) {
-            else => std.debug.panic("{s}: {}\n", .{ @src().fn_name, mcv }),
+            else => std.debug.panic("{s}: {f}\n", .{ @src().fn_name, mcv }),
             .register => |reg| {
                 const new_reg = try cg.register_manager.allocReg(new_temp_index.toIndex(), abi.RegisterClass.gp);
                 new_temp_index.tracking(cg).* = .init(.{ .register = new_reg });
@@ -186227,7 +186202,7 @@ const Temp = struct {
         const new_temp_index = cg.next_temp_index;
         cg.temp_type[@intFromEnum(new_temp_index)] = limb_ty;
         switch (temp.tracking(cg).short) {
-            else => |mcv| std.debug.panic("{s}: {}\n", .{ @src().fn_name, mcv }),
+            else => |mcv| std.debug.panic("{s}: {f}\n", .{ @src().fn_name, mcv }),
             .immediate => |imm| {
                 assert(limb_index == 0);
                 new_temp_index.tracking(cg).* = .init(.{ .immediate = imm });
@@ -186568,7 +186543,7 @@ const Temp = struct {
             },
             else => {},
         }
-        std.debug.panic("{s}: {} {}\n", .{ @src().fn_name, temp_tracking, overflow_temp_tracking });
+        std.debug.panic("{s}: {f} {f}\n", .{ @src().fn_name, temp_tracking, overflow_temp_tracking });
     }
 
     fn asMask(temp: Temp, info: MaskInfo, cg: *CodeGen) void {
@@ -186658,7 +186633,7 @@ const Temp = struct {
         while (try ptr.toLea(cg)) {}
         const val_mcv = val.tracking(cg).short;
         switch (val_mcv) {
-            else => |mcv| std.debug.panic("{s}: {}\n", .{ @src().fn_name, mcv }),
+            else => |mcv| std.debug.panic("{s}: {f}\n", .{ @src().fn_name, mcv }),
             .register => |val_reg| try ptr.loadReg(val_ty, registerAlias(
                 val_reg,
                 @intCast(val_ty.abiSize(cg.pt.zcu)),
@@ -186698,7 +186673,7 @@ const Temp = struct {
         {}) {
             const val_mcv = val.tracking(cg).short;
             switch (val_mcv) {
-                else => |mcv| std.debug.panic("{s}: {}\n", .{ @src().fn_name, mcv }),
+                else => |mcv| std.debug.panic("{s}: {f}\n", .{ @src().fn_name, mcv }),
                 .undef => if (opts.safe) {
                     var pat = try cg.tempInit(.u8, .{ .immediate = 0xaa });
                     var len = try cg.tempInit(.usize, .{ .immediate = val_ty.abiSize(cg.pt.zcu) });
@@ -186772,7 +186747,7 @@ const Temp = struct {
                             assert(!val_ty.optionalReprIsPayload(cg.pt.zcu));
                             break :first_ty opt_child;
                         },
-                        else => std.debug.panic("{s}: {}\n", .{ @src().fn_name, val_ty.fmt(cg.pt) }),
+                        else => std.debug.panic("{s}: {f}\n", .{ @src().fn_name, val_ty.fmt(cg.pt) }),
                     });
                     const first_size: u31 = @intCast(first_ty.abiSize(cg.pt.zcu));
                     try ptr.storeRegs(first_ty, &.{registerAlias(val_reg_ov.reg, first_size)}, cg);
@@ -186804,7 +186779,7 @@ const Temp = struct {
 
     fn readTo(src: *Temp, val_ty: Type, val_mcv: MCValue, opts: AccessOptions, cg: *CodeGen) InnerError!void {
         switch (val_mcv) {
-            else => |mcv| std.debug.panic("{s}: {}\n", .{ @src().fn_name, mcv }),
+            else => |mcv| std.debug.panic("{s}: {f}\n", .{ @src().fn_name, mcv }),
             .register => |val_reg| try src.readReg(opts.disp, val_ty, registerAlias(
                 val_reg,
                 @intCast(cg.unalignedSize(val_ty)),
@@ -186844,7 +186819,7 @@ const Temp = struct {
         {}) {
             const val_mcv = val.tracking(cg).short;
             switch (val_mcv) {
-                else => |mcv| std.debug.panic("{s}: {}\n", .{ @src().fn_name, mcv }),
+                else => |mcv| std.debug.panic("{s}: {f}\n", .{ @src().fn_name, mcv }),
                 .none => {},
                 .undef => if (opts.safe) {
                     var dst_ptr = try cg.tempInit(.usize, dst.tracking(cg).short.address().offset(opts.disp));
@@ -186905,7 +186880,7 @@ const Temp = struct {
                             assert(!val_ty.optionalReprIsPayload(cg.pt.zcu));
                             break :first_ty opt_child;
                         },
-                        else => std.debug.panic("{s}: {}\n", .{ @src().fn_name, val_ty.fmt(cg.pt) }),
+                        else => std.debug.panic("{s}: {f}\n", .{ @src().fn_name, val_ty.fmt(cg.pt) }),
                     });
                     const first_size: u31 = @intCast(first_ty.abiSize(cg.pt.zcu));
                     try dst.writeReg(opts.disp, first_ty, registerAlias(val_reg_ov.reg, first_size), cg);
@@ -191677,12 +191652,12 @@ const Temp = struct {
                             break :result result;
                         },
                     };
-                    tracking_log.debug("{} => {} (birth)", .{ inst, result });
+                    tracking_log.debug("{f} => {f} (birth)", .{ inst, result });
                     cg.inst_tracking.putAssumeCapacityNoClobber(inst, .init(result));
                 },
                 .temp => |temp_index| {
                     const temp_tracking = temp_index.tracking(cg);
-                    tracking_log.debug("{} => {} (birth)", .{ inst, temp_tracking.short });
+                    tracking_log.debug("{f} => {f} (birth)", .{ inst, temp_tracking.short });
                     cg.inst_tracking.putAssumeCapacityNoClobber(inst, .init(temp_tracking.short));
                     assert(cg.reuseTemp(inst, temp_index.toIndex(), temp_tracking));
                 },
@@ -191757,7 +191732,7 @@ fn resetTemps(cg: *CodeGen, from_index: Temp.Index) InnerError!void {
         const temp: Temp.Index = @enumFromInt(temp_index);
         if (temp.isValid(cg)) {
             any_valid = true;
-            tracking_log.err("failed to kill {}: {}", .{
+            tracking_log.err("failed to kill {f}: {f}", .{
                 temp.toIndex(),
                 cg.temp_type[temp_index].fmt(cg.pt),
             });
