@@ -1135,15 +1135,10 @@ fn formatWipMir(data: FormatWipMirData, w: *Writer) Writer.Error!void {
             try w.writeAll(lower.err_msg.?.msg);
             return;
         },
-        error.OutOfMemory, error.InvalidInstruction, error.CannotEncode => |e| {
-            try w.writeAll(switch (e) {
-                error.OutOfMemory => "Out of memory",
-                error.InvalidInstruction => "CodeGen failed to find a viable instruction.",
-                error.CannotEncode => "CodeGen failed to encode the instruction.",
-            });
+        else => |e| {
+            try w.writeAll(@errorName(e));
             return;
         },
-        else => |e| return e,
     }).insts) |lowered_inst| {
         if (!first) try w.writeAll("\ndebug(wip_mir): ");
         try w.print("  | {f}", .{lowered_inst});
