@@ -550,9 +550,9 @@ pub const MCValue = union(enum) {
                 @tagName(pl.reg),
             }),
             .indirect => |pl| try bw.print("[{s} + 0x{x}]", .{ @tagName(pl.reg), pl.off }),
-            .indirect_load_frame => |pl| try bw.print("[[{} + 0x{x}]]", .{ pl.index, pl.off }),
-            .load_frame => |pl| try bw.print("[{} + 0x{x}]", .{ pl.index, pl.off }),
-            .lea_frame => |pl| try bw.print("{} + 0x{x}", .{ pl.index, pl.off }),
+            .indirect_load_frame => |pl| try bw.print("[[{f} + 0x{x}]]", .{ pl.index, pl.off }),
+            .load_frame => |pl| try bw.print("[{f} + 0x{x}]", .{ pl.index, pl.off }),
+            .lea_frame => |pl| try bw.print("{f} + 0x{x}", .{ pl.index, pl.off }),
             .load_nav => |pl| try bw.print("[nav:{d}]", .{@intFromEnum(pl)}),
             .lea_nav => |pl| try bw.print("nav:{d}", .{@intFromEnum(pl)}),
             .load_uav => |pl| try bw.print("[uav:{d}]", .{@intFromEnum(pl.val)}),
@@ -561,10 +561,10 @@ pub const MCValue = union(enum) {
             .lea_lazy_sym => |pl| try bw.print("lazy:{s}:{d}", .{ @tagName(pl.kind), @intFromEnum(pl.ty) }),
             .load_extern_func => |pl| try bw.print("[extern:{d}]", .{@intFromEnum(pl)}),
             .lea_extern_func => |pl| try bw.print("extern:{d}", .{@intFromEnum(pl)}),
-            .elementwise_args => |pl| try bw.print("elementwise:{d}:[{} + 0x{x}]", .{
+            .elementwise_args => |pl| try bw.print("elementwise:{d}:[{f} + 0x{x}]", .{
                 pl.regs, pl.frame_index, pl.frame_off,
             }),
-            .reserved_frame => |pl| try bw.print("(dead:{})", .{pl}),
+            .reserved_frame => |pl| try bw.print("(dead:{f})", .{pl}),
             .air_ref => |pl| try bw.print("(air:0x{x})", .{@intFromEnum(pl)}),
         }
     }
@@ -1195,7 +1195,7 @@ fn formatWipMir(data: FormatWipMirData, w: *Writer) Writer.Error!void {
                 };
                 try w.print(" {f}", .{mem_op.fmt(.m)});
             },
-            .pseudo_dbg_arg_val, .pseudo_dbg_var_val => try w.print(" {}", .{
+            .pseudo_dbg_arg_val, .pseudo_dbg_var_val => try w.print(" {f}", .{
                 Value.fromInterned(mir_inst.data.ip_index).fmtValue(data.self.pt),
             }),
         }
@@ -12887,7 +12887,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nc, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(bin_op.lhs).fmt(pt),
                         ops[0].tracking(cg),
@@ -21764,7 +21764,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nc, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(bin_op.lhs).fmt(pt),
                         ops[0].tracking(cg),
@@ -32482,7 +32482,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ .@"0:", ._, .mov, .memad(.dst0q, .add_size, -8), .tmp3q, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(bin_op.lhs).fmt(pt),
                         ops[0].tracking(cg),
@@ -59310,7 +59310,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .@"or", .tmp4q, .tmp5q, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         ty_pl.ty.toType().fmt(pt),
                         ops[0].tracking(cg),
@@ -60809,7 +60809,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                             .{ ._, ._, .@"or", .dst0d, .tmp0d, ._, ._ },
                         } },
                     } }) catch |err| switch (err) {
-                        error.SelectFailed => return cg.fail("failed to select {s} {} {}", .{
+                        error.SelectFailed => return cg.fail("failed to select {s} {f} {f}", .{
                             @tagName(air_tag),
                             cg.typeOf(bin_op.rhs).fmt(pt),
                             ops[1].tracking(cg),
@@ -64066,7 +64066,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ .@"0:", ._, .mov, .memad(.dst0q, .add_size, -8), .tmp1q, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         lhs_ty.fmt(pt),
                         ops[0].tracking(cg),
@@ -79428,7 +79428,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                             .@"struct", .@"union" => {
                                 assert(ty.containerLayout(zcu) == .@"packed");
                                 for (&ops) |*op| op.wrapInt(cg) catch |err| switch (err) {
-                                    error.SelectFailed => return cg.fail("failed to select {s} wrap {} {}", .{
+                                    error.SelectFailed => return cg.fail("failed to select {s} wrap {f} {f}", .{
                                         @tagName(air_tag),
                                         ty.fmt(pt),
                                         op.tracking(cg),
@@ -86521,7 +86521,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         } },
                     }),
                 }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {s} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {s} {f} {f} {f}", .{
                         @tagName(air_tag),
                         @tagName(vector_cmp.compareOperator()),
                         cg.typeOf(vector_cmp.lhs).fmt(pt),
@@ -157186,7 +157186,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         } },
                     } },
                 }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s}.{s} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s}.{s} {f} {f}", .{
                         @tagName(air_tag),
                         @tagName(reduce.operation),
                         cg.typeOf(reduce.operand).fmt(pt),
@@ -157197,7 +157197,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                 switch (reduce.operation) {
                     .And, .Or, .Xor, .Min, .Max => {},
                     .Add, .Mul => if (cg.intInfo(res_ty)) |_| res[0].wrapInt(cg) catch |err| switch (err) {
-                        error.SelectFailed => return cg.fail("failed to select {s}.{s} wrap {} {}", .{
+                        error.SelectFailed => return cg.fail("failed to select {s}.{s} wrap {f} {f}", .{
                             @tagName(air_tag),
                             @tagName(reduce.operation),
                             res_ty.fmt(pt),
@@ -164480,7 +164480,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         } },
                     } },
                 }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s}.{s} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s}.{s} {f} {f}", .{
                         @tagName(air_tag),
                         @tagName(reduce.operation),
                         cg.typeOf(reduce.operand).fmt(pt),
@@ -166277,7 +166277,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nz, .j, .@"0b", ._, ._, ._ },
                     } },
                 } }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f}", .{
                         @tagName(air_tag),
                         ty_op.ty.toType().fmt(pt),
                         ops[0].tracking(cg),
@@ -166293,7 +166293,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                 const bin_op = air_datas[@intFromEnum(inst)].bin_op;
                 var ops = try cg.tempsFromOperands(inst, .{ bin_op.lhs, bin_op.rhs }) ++ .{undefined};
                 ops[2] = ops[0].getByteLen(cg) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(bin_op.lhs).fmt(pt),
                         cg.typeOf(bin_op.rhs).fmt(pt),
@@ -166333,7 +166333,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         } },
                     }},
                 }) catch |err| switch (err) {
-                    error.SelectFailed => return cg.fail("failed to select {s} {} {} {} {} {}", .{
+                    error.SelectFailed => return cg.fail("failed to select {s} {f} {f} {f} {f} {f}", .{
                         @tagName(air_tag),
                         cg.typeOf(bin_op.lhs).fmt(pt),
                         cg.typeOf(bin_op.rhs).fmt(pt),
@@ -181502,7 +181502,7 @@ fn genSetReg(
                     assert(!ty.optionalReprIsPayload(zcu));
                     break :first_ty opt_child;
                 },
-                else => std.debug.panic("{s}: {}\n", .{ @src().fn_name, ty.fmt(pt) }),
+                else => std.debug.panic("{s}: {f}\n", .{ @src().fn_name, ty.fmt(pt) }),
             });
             const first_size: u31 = @intCast(first_ty.abiSize(zcu));
             const frame_size = std.math.ceilPowerOfTwoAssert(u32, abi_size);
@@ -186930,7 +186930,7 @@ const Temp = struct {
                 assert(src_regs.len == std.math.divCeil(u16, int_info.bits, 64) catch unreachable);
                 break :part_ty .u64;
             } else part_ty: switch (ip.indexToKey(src_ty.toIntern())) {
-                else => std.debug.panic("{s}: {}\n", .{ @src().fn_name, src_ty.fmt(cg.pt) }),
+                else => std.debug.panic("{s}: {f}\n", .{ @src().fn_name, src_ty.fmt(cg.pt) }),
                 .ptr_type => |ptr_info| {
                     assert(ptr_info.flags.size == .slice);
                     assert(src_regs.len == 2);
@@ -186941,7 +186941,7 @@ const Temp = struct {
                     break :part_ty try cg.pt.intType(.unsigned, @as(u16, 8) * @min(src_abi_size, 8));
                 },
                 .opt_type => |opt_child| switch (ip.indexToKey(opt_child)) {
-                    else => std.debug.panic("{s}: {}\n", .{ @src().fn_name, src_ty.fmt(cg.pt) }),
+                    else => std.debug.panic("{s}: {f}\n", .{ @src().fn_name, src_ty.fmt(cg.pt) }),
                     .ptr_type => |ptr_info| {
                         assert(ptr_info.flags.size == .slice);
                         assert(src_regs.len == 2);
