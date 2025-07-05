@@ -525,7 +525,7 @@ pub const MCValue = union(enum) {
         };
     }
 
-    pub fn format(mcv: MCValue, bw: *Writer, comptime _: []const u8) Writer.Error!void {
+    pub fn format(mcv: MCValue, bw: *Writer) Writer.Error!void {
         switch (mcv) {
             .none, .unreach, .dead, .undef => try bw.print("({s})", .{@tagName(mcv)}),
             .immediate => |pl| try bw.print("0x{x}", .{pl}),
@@ -812,7 +812,7 @@ const InstTracking = struct {
         }
     }
 
-    pub fn format(tracking: InstTracking, bw: *Writer, comptime _: []const u8) Writer.Error!void {
+    pub fn format(tracking: InstTracking, bw: *Writer) Writer.Error!void {
         if (!std.meta.eql(tracking.long, tracking.short)) try bw.print("|{f}| ", .{tracking.long});
         try bw.print("{f}", .{tracking.short});
     }
