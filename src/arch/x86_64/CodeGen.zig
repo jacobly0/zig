@@ -525,47 +525,47 @@ pub const MCValue = union(enum) {
         };
     }
 
-    pub fn format(mcv: MCValue, bw: *Writer) Writer.Error!void {
+    pub fn format(mcv: MCValue, w: *Writer) Writer.Error!void {
         switch (mcv) {
-            .none, .unreach, .dead, .undef => try bw.print("({s})", .{@tagName(mcv)}),
-            .immediate => |pl| try bw.print("0x{x}", .{pl}),
-            .memory => |pl| try bw.print("[ds:0x{x}]", .{pl}),
-            inline .eflags, .register => |pl| try bw.print("{s}", .{@tagName(pl)}),
-            .register_pair => |pl| try bw.print("{s}:{s}", .{ @tagName(pl[1]), @tagName(pl[0]) }),
-            .register_triple => |pl| try bw.print("{s}:{s}:{s}", .{
+            .none, .unreach, .dead, .undef => try w.print("({s})", .{@tagName(mcv)}),
+            .immediate => |pl| try w.print("0x{x}", .{pl}),
+            .memory => |pl| try w.print("[ds:0x{x}]", .{pl}),
+            inline .eflags, .register => |pl| try w.print("{s}", .{@tagName(pl)}),
+            .register_pair => |pl| try w.print("{s}:{s}", .{ @tagName(pl[1]), @tagName(pl[0]) }),
+            .register_triple => |pl| try w.print("{s}:{s}:{s}", .{
                 @tagName(pl[2]), @tagName(pl[1]), @tagName(pl[0]),
             }),
-            .register_quadruple => |pl| try bw.print("{s}:{s}:{s}:{s}", .{
+            .register_quadruple => |pl| try w.print("{s}:{s}:{s}:{s}", .{
                 @tagName(pl[3]), @tagName(pl[2]), @tagName(pl[1]), @tagName(pl[0]),
             }),
-            .register_offset => |pl| try bw.print("{s} + 0x{x}", .{ @tagName(pl.reg), pl.off }),
-            .register_overflow => |pl| try bw.print("{s}:{s}", .{
+            .register_offset => |pl| try w.print("{s} + 0x{x}", .{ @tagName(pl.reg), pl.off }),
+            .register_overflow => |pl| try w.print("{s}:{s}", .{
                 @tagName(pl.eflags),
                 @tagName(pl.reg),
             }),
-            .register_mask => |pl| try bw.print("mask({s},{f}):{c}{s}", .{
+            .register_mask => |pl| try w.print("mask({s},{f}):{c}{s}", .{
                 @tagName(pl.info.kind),
                 pl.info.scalar,
                 @as(u8, if (pl.info.inverted) '!' else ' '),
                 @tagName(pl.reg),
             }),
-            .indirect => |pl| try bw.print("[{s} + 0x{x}]", .{ @tagName(pl.reg), pl.off }),
-            .indirect_load_frame => |pl| try bw.print("[[{f} + 0x{x}]]", .{ pl.index, pl.off }),
-            .load_frame => |pl| try bw.print("[{f} + 0x{x}]", .{ pl.index, pl.off }),
-            .lea_frame => |pl| try bw.print("{f} + 0x{x}", .{ pl.index, pl.off }),
-            .load_nav => |pl| try bw.print("[nav:{d}]", .{@intFromEnum(pl)}),
-            .lea_nav => |pl| try bw.print("nav:{d}", .{@intFromEnum(pl)}),
-            .load_uav => |pl| try bw.print("[uav:{d}]", .{@intFromEnum(pl.val)}),
-            .lea_uav => |pl| try bw.print("uav:{d}", .{@intFromEnum(pl.val)}),
-            .load_lazy_sym => |pl| try bw.print("[lazy:{s}:{d}]", .{ @tagName(pl.kind), @intFromEnum(pl.ty) }),
-            .lea_lazy_sym => |pl| try bw.print("lazy:{s}:{d}", .{ @tagName(pl.kind), @intFromEnum(pl.ty) }),
-            .load_extern_func => |pl| try bw.print("[extern:{d}]", .{@intFromEnum(pl)}),
-            .lea_extern_func => |pl| try bw.print("extern:{d}", .{@intFromEnum(pl)}),
-            .elementwise_args => |pl| try bw.print("elementwise:{d}:[{f} + 0x{x}]", .{
+            .indirect => |pl| try w.print("[{s} + 0x{x}]", .{ @tagName(pl.reg), pl.off }),
+            .indirect_load_frame => |pl| try w.print("[[{} + 0x{x}]]", .{ pl.index, pl.off }),
+            .load_frame => |pl| try w.print("[{} + 0x{x}]", .{ pl.index, pl.off }),
+            .lea_frame => |pl| try w.print("{} + 0x{x}", .{ pl.index, pl.off }),
+            .load_nav => |pl| try w.print("[nav:{d}]", .{@intFromEnum(pl)}),
+            .lea_nav => |pl| try w.print("nav:{d}", .{@intFromEnum(pl)}),
+            .load_uav => |pl| try w.print("[uav:{d}]", .{@intFromEnum(pl.val)}),
+            .lea_uav => |pl| try w.print("uav:{d}", .{@intFromEnum(pl.val)}),
+            .load_lazy_sym => |pl| try w.print("[lazy:{s}:{d}]", .{ @tagName(pl.kind), @intFromEnum(pl.ty) }),
+            .lea_lazy_sym => |pl| try w.print("lazy:{s}:{d}", .{ @tagName(pl.kind), @intFromEnum(pl.ty) }),
+            .load_extern_func => |pl| try w.print("[extern:{d}]", .{@intFromEnum(pl)}),
+            .lea_extern_func => |pl| try w.print("extern:{d}", .{@intFromEnum(pl)}),
+            .elementwise_args => |pl| try w.print("elementwise:{d}:[{} + 0x{x}]", .{
                 pl.regs, pl.frame_index, pl.frame_off,
             }),
-            .reserved_frame => |pl| try bw.print("(dead:{f})", .{pl}),
-            .air_ref => |pl| try bw.print("(air:0x{x})", .{@intFromEnum(pl)}),
+            .reserved_frame => |pl| try w.print("(dead:{})", .{pl}),
+            .air_ref => |pl| try w.print("(air:0x{x})", .{@intFromEnum(pl)}),
         }
     }
 };
@@ -2026,7 +2026,7 @@ fn gen(
                     .{},
                 );
                 self.ret_mcv.long = .{ .load_frame = .{ .index = frame_index } };
-                tracking_log.debug("spill {f} to {f}", .{ self.ret_mcv.long, frame_index });
+                tracking_log.debug("spill {f} to {}", .{ self.ret_mcv.long, frame_index });
             },
             else => unreachable,
         }
