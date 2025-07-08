@@ -6,7 +6,8 @@
 #file=main.zig
 const std = @import("std");
 pub fn main() !void {
-    try std.io.getStdOut().writer().print("{d} {d}\n", .{ foo(), bar() });
+    var stdout_writer = std.fs.File.stdout().writerStreaming(&.{});
+    try stdout_writer.interface.print("{d} {d}\n", .{ foo(), bar() });
 }
 fn foo() u32 {
     return @src().line;
@@ -20,7 +21,8 @@ fn bar() u32 {
 #file=main.zig
 const std = @import("std");
 pub fn main() !void {
-    try std.io.getStdOut().writer().print("{d} {d}\n", .{ foo(), bar() });
+    var stdout_writer = std.fs.File.stdout().writerStreaming(&.{});
+    try stdout_writer.interface.print("{d} {d}\n", .{ foo(), bar() });
 }
 
 fn foo() u32 {

@@ -9,7 +9,8 @@ const MyEnum = enum(u8) {
     bar = 2,
 };
 pub fn main() !void {
-    try std.io.getStdOut().writer().print("{}\n", .{@intFromEnum(MyEnum.foo)});
+    var stdout_writer = std.fs.File.stdout().writerStreaming(&.{});
+    try stdout_writer.interface.print("{}\n", .{@intFromEnum(MyEnum.foo)});
 }
 const std = @import("std");
 #expect_stdout="1\n"
@@ -20,7 +21,8 @@ const MyEnum = enum(u8) {
     bar = 2,
 };
 pub fn main() !void {
-    try std.io.getStdOut().writer().print("{}\n", .{@intFromEnum(MyEnum.foo)});
+    var stdout_writer = std.fs.File.stdout().writerStreaming(&.{});
+    try stdout_writer.interface.print("{}\n", .{@intFromEnum(MyEnum.foo)});
 }
 const std = @import("std");
 #expect_error=main.zig:6:73: error: enum 'main.MyEnum' has no member named 'foo'
