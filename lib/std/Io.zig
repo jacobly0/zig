@@ -81,6 +81,7 @@ pub const Limit = enum(usize) {
 
 pub const Reader = @import("Io/Reader.zig");
 pub const Writer = @import("Io/Writer.zig");
+pub const jobserver = @import("Io/jobserver.zig");
 
 pub const tty = @import("Io/tty.zig");
 

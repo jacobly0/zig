@@ -388,6 +388,7 @@ set(ZIG_STAGE2_SOURCES
     lib/std/Io.zig
     lib/std/Io/Reader.zig
     lib/std/Io/Writer.zig
+    lib/std/Io/jobserver.zig
     lib/std/Progress.zig
     lib/std/Random.zig
     lib/std/Target.zig

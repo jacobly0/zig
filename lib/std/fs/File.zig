@@ -152,7 +152,7 @@ pub fn isCygwinPty(file: File) bool {
             .SUCCESS => {},
             else => return false,
         }
-        if (device_info.DeviceType != windows.FILE_DEVICE_NAMED_PIPE) return false;
+        if (device_info.DeviceType.FileDevice != .NAMED_PIPE) return false;
     }
 
     const name_bytes_offset = @offsetOf(windows.FILE_NAME_INFO, "FileName");

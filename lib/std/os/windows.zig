@@ -28,9 +28,19 @@ pub const ws2_32 = @import("windows/ws2_32.zig");
 pub const crypt32 = @import("windows/crypt32.zig");
 pub const nls = @import("windows/nls.zig");
 
-pub const self_process_handle = @as(HANDLE, @ptrFromInt(maxInt(usize)));
-
-const Self = @This();
+// ntdef.h
+pub const EVENT_TYPE = enum(c_int) {
+    Notification,
+    Synchronization,
+};
+pub const TIMER_TYPE = enum(c_int) {
+    Notification,
+    Synchronization,
+};
+pub const WAIT_TYPE = enum(c_int) {
+    All,
+    Any,
+};
 
 pub const OpenError = error{
     IsDir,
@@ -82,12 +92,12 @@ pub fn OpenFile(sub_path_w: []const u16, options: OpenFileOptions) OpenError!HAN
     var result: HANDLE = undefined;
 
     const path_len_bytes = math.cast(u16, sub_path_w.len * 2) orelse return error.NameTooLong;
-    var nt_name = UNICODE_STRING{
+    var nt_name: UNICODE_STRING = .{
         .Length = path_len_bytes,
         .MaximumLength = path_len_bytes,
         .Buffer = @constCast(sub_path_w.ptr),
     };
-    var attr = OBJECT_ATTRIBUTES{
+    const attr: OBJECT_ATTRIBUTES = .{
         .Length = @sizeOf(OBJECT_ATTRIBUTES),
         .RootDirectory = if (std.fs.path.isAbsoluteWindowsWtf16(sub_path_w)) null else options.dir,
         .Attributes = if (options.sa) |ptr| blk: { // Note we do not use OBJ_CASE_INSENSITIVE here.
@@ -327,6 +337,7 @@ pub const DeviceIoControlError = error{
     /// The volume does not contain a recognized file system. File system
     /// drivers might not be loaded, or the volume may be corrupt.
     UnrecognizedVolume,
+    Pending,
     Unexpected,
 };
 
@@ -335,48 +346,43 @@ pub const DeviceIoControlError = error{
 /// as a direct substitute for that call.
 /// TODO work out if we need to expose other arguments to the underlying syscalls.
 pub fn DeviceIoControl(
-    h: HANDLE,
-    ioControlCode: ULONG,
-    in: ?[]const u8,
-    out: ?[]u8,
+    device: HANDLE,
+    io_control_code: CTL_CODE,
+    opts: struct {
+        event: ?HANDLE = null,
+        apc_routine: ?IO_APC_ROUTINE = null,
+        apc_context: ?*anyopaque = null,
+        io_status_block: ?*IO_STATUS_BLOCK = null,
+        in: []const u8 = &.{},
+        out: []u8 = &.{},
+    },
 ) DeviceIoControlError!void {
-    // Logic from: https://doxygen.reactos.org/d3/d74/deviceio_8c.html
-    const is_fsctl = (ioControlCode >> 16) == FILE_DEVICE_FILE_SYSTEM;
-
-    var io: IO_STATUS_BLOCK = undefined;
-    const in_ptr = if (in) |i| i.ptr else null;
-    const in_len = if (in) |i| @as(ULONG, @intCast(i.len)) else 0;
-    const out_ptr = if (out) |o| o.ptr else null;
-    const out_len = if (out) |o| @as(ULONG, @intCast(o.len)) else 0;
-
-    const rc = blk: {
-        if (is_fsctl) {
-            break :blk ntdll.NtFsControlFile(
-                h,
-                null,
-                null,
-                null,
-                &io,
-                ioControlCode,
-                in_ptr,
-                in_len,
-                out_ptr,
-                out_len,
-            );
-        } else {
-            break :blk ntdll.NtDeviceIoControlFile(
-                h,
-                null,
-                null,
-                null,
-                &io,
-                ioControlCode,
-                in_ptr,
-                in_len,
-                out_ptr,
-                out_len,
-            );
-        }
+    var io_status_block: IO_STATUS_BLOCK = undefined;
+    const rc = switch (io_control_code.DeviceType) {
+        .FILE_SYSTEM, .NAMED_PIPE => ntdll.NtFsControlFile(
+            device,
+            opts.event,
+            opts.apc_routine,
+            opts.apc_context,
+            opts.io_status_block orelse &io_status_block,
+            io_control_code,
+            if (opts.in.len > 0) opts.in.ptr else null,
+            @intCast(opts.in.len),
+            if (opts.out.len > 0) opts.out.ptr else null,
+            @intCast(opts.out.len),
+        ),
+        else => ntdll.NtDeviceIoControlFile(
+            device,
+            opts.event,
+            opts.apc_routine,
+            opts.apc_context,
+            opts.io_status_block orelse &io_status_block,
+            io_control_code,
+            if (opts.in.len > 0) opts.in.ptr else null,
+            @intCast(opts.in.len),
+            if (opts.out.len > 0) opts.out.ptr else null,
+            @intCast(opts.out.len),
+        ),
     };
     switch (rc) {
         .SUCCESS => {},
@@ -385,9 +391,40 @@ pub fn DeviceIoControl(
         .INVALID_DEVICE_REQUEST => return error.AccessDenied, // Not supported by the underlying filesystem
         .INVALID_PARAMETER => unreachable,
         .UNRECOGNIZED_VOLUME => return error.UnrecognizedVolume,
+        .PENDING => return error.Pending,
         else => return unexpectedStatus(rc),
     }
 }
+
+pub const FILE_PIPE_WAIT_FOR_BUFFER = extern struct {
+    Timeout: LARGE_INTEGER = WAIT_FOREVER,
+    NameLength: ULONG,
+    TimeoutSpecified: BOOLEAN,
+    Name: [PATH_MAX_WIDE]WCHAR,
+
+    pub const WAIT_FOREVER: LARGE_INTEGER = std.math.minInt(LARGE_INTEGER);
+
+    pub fn init(basename: []const WCHAR, Timeout: ?LARGE_INTEGER) FILE_PIPE_WAIT_FOR_BUFFER {
+        var fpwfb: FILE_PIPE_WAIT_FOR_BUFFER = .{
+            .Timeout = Timeout orelse undefined,
+            .NameLength = @intCast(@sizeOf(WCHAR) * basename.len),
+            .TimeoutSpecified = @intFromBool(Timeout != null),
+            .Name = undefined,
+        };
+        @memcpy(fpwfb.Name[0..basename.len], basename);
+        @memset(fpwfb.Name[basename.len..std.mem.alignForward(usize, basename.len, 2)], 0);
+        return fpwfb;
+    }
+
+    pub fn getName(fpwfb: *const FILE_PIPE_WAIT_FOR_BUFFER) []WCHAR {
+        return fpwfb.Name[@sizeOf(FILE_PIPE_WAIT_FOR_BUFFER)..][0..fpwfb.NameLength];
+    }
+
+    pub fn toBuffer(fpwfb: *const FILE_PIPE_WAIT_FOR_BUFFER) []const u8 {
+        const start: [*]const u8 = @ptrCast(fpwfb);
+        return start[0..std.mem.alignForward(ULONG, @offsetOf(FILE_PIPE_WAIT_FOR_BUFFER, "Name") + fpwfb.NameLength, 4)];
+    }
+};
 
 pub fn GetOverlappedResult(h: HANDLE, overlapped: *OVERLAPPED, wait: bool) !DWORD {
     var bytes: DWORD = undefined;
@@ -880,7 +917,7 @@ pub fn CreateSymbolicLink(
     @memcpy(buffer[@sizeOf(SYMLINK_DATA)..][0 .. final_target_path.len * 2], @as([*]const u8, @ptrCast(final_target_path)));
     const paths_start = @sizeOf(SYMLINK_DATA) + final_target_path.len * 2;
     @memcpy(buffer[paths_start..][0 .. final_target_path.len * 2], @as([*]const u8, @ptrCast(final_target_path)));
-    _ = try DeviceIoControl(symlink_handle, FSCTL_SET_REPARSE_POINT, buffer[0..buf_len], null);
+    _ = try DeviceIoControl(symlink_handle, FSCTL.SET_REPARSE_POINT, buffer[0..buf_len], null);
 }
 
 pub const ReadLinkError = error{
@@ -947,7 +984,7 @@ pub fn ReadLink(dir: ?HANDLE, sub_path_w: []const u16, out_buffer: []u8) ReadLin
     defer CloseHandle(result_handle);
 
     var reparse_buf: [MAXIMUM_REPARSE_DATA_BUFFER_SIZE]u8 align(@alignOf(REPARSE_DATA_BUFFER)) = undefined;
-    _ = DeviceIoControl(result_handle, FSCTL_GET_REPARSE_POINT, null, reparse_buf[0..]) catch |err| switch (err) {
+    _ = DeviceIoControl(result_handle, FSCTL.GET_REPARSE_POINT, null, reparse_buf[0..]) catch |err| switch (err) {
         error.AccessDenied => return error.Unexpected,
         error.UnrecognizedVolume => return error.Unexpected,
         else => |e| return e,
@@ -1390,8 +1427,9 @@ pub fn GetFinalPathNameByHandle(
             input_struct.DeviceNameLength = @intCast(volume_name_u16.len * 2);
             @memcpy(input_buf[@sizeOf(MOUNTMGR_MOUNT_POINT)..][0 .. volume_name_u16.len * 2], @as([*]const u8, @ptrCast(volume_name_u16.ptr)));
 
-            DeviceIoControl(mgmt_handle, IOCTL_MOUNTMGR_QUERY_POINTS, &input_buf, &output_buf) catch |err| switch (err) {
+            DeviceIoControl(mgmt_handle, IOCTL.MOUNTMGR.QUERY_POINTS, .{ .in = &input_buf, .out = &output_buf }) catch |err| switch (err) {
                 error.AccessDenied => return error.Unexpected,
+                error.Pending => unreachable,
                 else => |e| return e,
             };
             const mount_points_struct: *const MOUNTMGR_MOUNT_POINTS = @ptrCast(&output_buf[0]);
@@ -1445,8 +1483,9 @@ pub fn GetFinalPathNameByHandle(
                     vol_input_struct.DeviceNameLength = @intCast(symlink.len * 2);
                     @memcpy(@as([*]WCHAR, &vol_input_struct.DeviceName)[0..symlink.len], symlink);
 
-                    DeviceIoControl(mgmt_handle, IOCTL_MOUNTMGR_QUERY_DOS_VOLUME_PATH, &vol_input_buf, &vol_output_buf) catch |err| switch (err) {
+                    DeviceIoControl(mgmt_handle, IOCTL.MOUNTMGR.QUERY_DOS_VOLUME_PATH, .{ .in = &vol_input_buf, .out = &vol_output_buf }) catch |err| switch (err) {
                         error.AccessDenied => return error.Unexpected,
+                        error.Pending => unreachable,
                         else => |e| return e,
                     };
                     const volume_paths_struct: *const MOUNTMGR_VOLUME_PATHS = @ptrCast(&vol_output_buf[0]);
@@ -1723,7 +1762,7 @@ pub fn VirtualProtect(lpAddress: ?LPVOID, dwSize: SIZE_T, flNewProtect: DWORD, l
     // ntdll takes an extra level of indirection here
     var addr = lpAddress;
     var size = dwSize;
-    switch (ntdll.NtProtectVirtualMemory(self_process_handle, &addr, &size, flNewProtect, lpflOldProtect)) {
+    switch (ntdll.NtProtectVirtualMemory(GetCurrentProcess(), &addr, &size, flNewProtect, lpflOldProtect)) {
         .SUCCESS => {},
         .INVALID_ADDRESS => return error.InvalidAddress,
         else => |st| return unexpectedStatus(st),
@@ -1996,7 +2035,7 @@ pub const LockFileError = error{
 pub fn LockFile(
     FileHandle: HANDLE,
     Event: ?HANDLE,
-    ApcRoutine: ?*IO_APC_ROUTINE,
+    ApcRoutine: ?IO_APC_ROUTINE,
     ApcContext: ?*anyopaque,
     IoStatusBlock: *IO_STATUS_BLOCK,
     ByteOffset: *const LARGE_INTEGER,
@@ -2824,112 +2863,162 @@ pub const PCTSTR = @compileError("Deprecated: choose between `PCSTR` or `PCWSTR`
 pub const TRUE = 1;
 pub const FALSE = 0;
 
-pub const DEVICE_TYPE = ULONG;
-pub const FILE_DEVICE_BEEP: DEVICE_TYPE = 0x0001;
-pub const FILE_DEVICE_CD_ROM: DEVICE_TYPE = 0x0002;
-pub const FILE_DEVICE_CD_ROM_FILE_SYSTEM: DEVICE_TYPE = 0x0003;
-pub const FILE_DEVICE_CONTROLLER: DEVICE_TYPE = 0x0004;
-pub const FILE_DEVICE_DATALINK: DEVICE_TYPE = 0x0005;
-pub const FILE_DEVICE_DFS: DEVICE_TYPE = 0x0006;
-pub const FILE_DEVICE_DISK: DEVICE_TYPE = 0x0007;
-pub const FILE_DEVICE_DISK_FILE_SYSTEM: DEVICE_TYPE = 0x0008;
-pub const FILE_DEVICE_FILE_SYSTEM: DEVICE_TYPE = 0x0009;
-pub const FILE_DEVICE_INPORT_PORT: DEVICE_TYPE = 0x000a;
-pub const FILE_DEVICE_KEYBOARD: DEVICE_TYPE = 0x000b;
-pub const FILE_DEVICE_MAILSLOT: DEVICE_TYPE = 0x000c;
-pub const FILE_DEVICE_MIDI_IN: DEVICE_TYPE = 0x000d;
-pub const FILE_DEVICE_MIDI_OUT: DEVICE_TYPE = 0x000e;
-pub const FILE_DEVICE_MOUSE: DEVICE_TYPE = 0x000f;
-pub const FILE_DEVICE_MULTI_UNC_PROVIDER: DEVICE_TYPE = 0x0010;
-pub const FILE_DEVICE_NAMED_PIPE: DEVICE_TYPE = 0x0011;
-pub const FILE_DEVICE_NETWORK: DEVICE_TYPE = 0x0012;
-pub const FILE_DEVICE_NETWORK_BROWSER: DEVICE_TYPE = 0x0013;
-pub const FILE_DEVICE_NETWORK_FILE_SYSTEM: DEVICE_TYPE = 0x0014;
-pub const FILE_DEVICE_NULL: DEVICE_TYPE = 0x0015;
-pub const FILE_DEVICE_PARALLEL_PORT: DEVICE_TYPE = 0x0016;
-pub const FILE_DEVICE_PHYSICAL_NETCARD: DEVICE_TYPE = 0x0017;
-pub const FILE_DEVICE_PRINTER: DEVICE_TYPE = 0x0018;
-pub const FILE_DEVICE_SCANNER: DEVICE_TYPE = 0x0019;
-pub const FILE_DEVICE_SERIAL_MOUSE_PORT: DEVICE_TYPE = 0x001a;
-pub const FILE_DEVICE_SERIAL_PORT: DEVICE_TYPE = 0x001b;
-pub const FILE_DEVICE_SCREEN: DEVICE_TYPE = 0x001c;
-pub const FILE_DEVICE_SOUND: DEVICE_TYPE = 0x001d;
-pub const FILE_DEVICE_STREAMS: DEVICE_TYPE = 0x001e;
-pub const FILE_DEVICE_TAPE: DEVICE_TYPE = 0x001f;
-pub const FILE_DEVICE_TAPE_FILE_SYSTEM: DEVICE_TYPE = 0x0020;
-pub const FILE_DEVICE_TRANSPORT: DEVICE_TYPE = 0x0021;
-pub const FILE_DEVICE_UNKNOWN: DEVICE_TYPE = 0x0022;
-pub const FILE_DEVICE_VIDEO: DEVICE_TYPE = 0x0023;
-pub const FILE_DEVICE_VIRTUAL_DISK: DEVICE_TYPE = 0x0024;
-pub const FILE_DEVICE_WAVE_IN: DEVICE_TYPE = 0x0025;
-pub const FILE_DEVICE_WAVE_OUT: DEVICE_TYPE = 0x0026;
-pub const FILE_DEVICE_8042_PORT: DEVICE_TYPE = 0x0027;
-pub const FILE_DEVICE_NETWORK_REDIRECTOR: DEVICE_TYPE = 0x0028;
-pub const FILE_DEVICE_BATTERY: DEVICE_TYPE = 0x0029;
-pub const FILE_DEVICE_BUS_EXTENDER: DEVICE_TYPE = 0x002a;
-pub const FILE_DEVICE_MODEM: DEVICE_TYPE = 0x002b;
-pub const FILE_DEVICE_VDM: DEVICE_TYPE = 0x002c;
-pub const FILE_DEVICE_MASS_STORAGE: DEVICE_TYPE = 0x002d;
-pub const FILE_DEVICE_SMB: DEVICE_TYPE = 0x002e;
-pub const FILE_DEVICE_KS: DEVICE_TYPE = 0x002f;
-pub const FILE_DEVICE_CHANGER: DEVICE_TYPE = 0x0030;
-pub const FILE_DEVICE_SMARTCARD: DEVICE_TYPE = 0x0031;
-pub const FILE_DEVICE_ACPI: DEVICE_TYPE = 0x0032;
-pub const FILE_DEVICE_DVD: DEVICE_TYPE = 0x0033;
-pub const FILE_DEVICE_FULLSCREEN_VIDEO: DEVICE_TYPE = 0x0034;
-pub const FILE_DEVICE_DFS_FILE_SYSTEM: DEVICE_TYPE = 0x0035;
-pub const FILE_DEVICE_DFS_VOLUME: DEVICE_TYPE = 0x0036;
-pub const FILE_DEVICE_SERENUM: DEVICE_TYPE = 0x0037;
-pub const FILE_DEVICE_TERMSRV: DEVICE_TYPE = 0x0038;
-pub const FILE_DEVICE_KSEC: DEVICE_TYPE = 0x0039;
-pub const FILE_DEVICE_FIPS: DEVICE_TYPE = 0x003a;
-pub const FILE_DEVICE_INFINIBAND: DEVICE_TYPE = 0x003b;
-// TODO: missing values?
-pub const FILE_DEVICE_VMBUS: DEVICE_TYPE = 0x003e;
-pub const FILE_DEVICE_CRYPT_PROVIDER: DEVICE_TYPE = 0x003f;
-pub const FILE_DEVICE_WPD: DEVICE_TYPE = 0x0040;
-pub const FILE_DEVICE_BLUETOOTH: DEVICE_TYPE = 0x0041;
-pub const FILE_DEVICE_MT_COMPOSITE: DEVICE_TYPE = 0x0042;
-pub const FILE_DEVICE_MT_TRANSPORT: DEVICE_TYPE = 0x0043;
-pub const FILE_DEVICE_BIOMETRIC: DEVICE_TYPE = 0x0044;
-pub const FILE_DEVICE_PMI: DEVICE_TYPE = 0x0045;
-pub const FILE_DEVICE_EHSTOR: DEVICE_TYPE = 0x0046;
-pub const FILE_DEVICE_DEVAPI: DEVICE_TYPE = 0x0047;
-pub const FILE_DEVICE_GPIO: DEVICE_TYPE = 0x0048;
-pub const FILE_DEVICE_USBEX: DEVICE_TYPE = 0x0049;
-pub const FILE_DEVICE_CONSOLE: DEVICE_TYPE = 0x0050;
-pub const FILE_DEVICE_NFP: DEVICE_TYPE = 0x0051;
-pub const FILE_DEVICE_SYSENV: DEVICE_TYPE = 0x0052;
-pub const FILE_DEVICE_VIRTUAL_BLOCK: DEVICE_TYPE = 0x0053;
-pub const FILE_DEVICE_POINT_OF_SERVICE: DEVICE_TYPE = 0x0054;
-pub const FILE_DEVICE_STORAGE_REPLICATION: DEVICE_TYPE = 0x0055;
-pub const FILE_DEVICE_TRUST_ENV: DEVICE_TYPE = 0x0056;
-pub const FILE_DEVICE_UCM: DEVICE_TYPE = 0x0057;
-pub const FILE_DEVICE_UCMTCPCI: DEVICE_TYPE = 0x0058;
-pub const FILE_DEVICE_PERSISTENT_MEMORY: DEVICE_TYPE = 0x0059;
-pub const FILE_DEVICE_NVDIMM: DEVICE_TYPE = 0x005a;
-pub const FILE_DEVICE_HOLOGRAPHIC: DEVICE_TYPE = 0x005b;
-pub const FILE_DEVICE_SDFXHCI: DEVICE_TYPE = 0x005c;
+pub const CTL_CODE = packed struct(ULONG) {
+    Method: METHOD,
+    Function: u12,
+    Access: FILE_ACCESS,
+    DeviceType: FILE_DEVICE,
 
-/// https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/buffer-descriptions-for-i-o-control-codes
-pub const TransferType = enum(u2) {
-    METHOD_BUFFERED = 0,
-    METHOD_IN_DIRECT = 1,
-    METHOD_OUT_DIRECT = 2,
-    METHOD_NEITHER = 3,
+    pub const METHOD = enum(u2) {
+        BUFFERED = 0,
+        IN_DIRECT = 1,
+        OUT_DIRECT = 2,
+        NEITHER = 3,
+    };
+
+    pub const FILE_ACCESS = packed struct(u2) {
+        READ: bool = false,
+        WRITE: bool = false,
+
+        pub const ANY: FILE_ACCESS = .{ .READ = false, .WRITE = false };
+        pub const SPECIAL = ANY;
+    };
+
+    pub const FILE_DEVICE = enum(u16) {
+        BEEP = 0x00000001,
+        CD_ROM = 0x00000002,
+        CD_ROM_FILE_SYSTEM = 0x00000003,
+        CONTROLLER = 0x00000004,
+        DATALINK = 0x00000005,
+        DFS = 0x00000006,
+        DISK = 0x00000007,
+        DISK_FILE_SYSTEM = 0x00000008,
+        FILE_SYSTEM = 0x00000009,
+        INPORT_PORT = 0x0000000a,
+        KEYBOARD = 0x0000000b,
+        MAILSLOT = 0x0000000c,
+        MIDI_IN = 0x0000000d,
+        MIDI_OUT = 0x0000000e,
+        MOUSE = 0x0000000f,
+        MULTI_UNC_PROVIDER = 0x00000010,
+        NAMED_PIPE = 0x00000011,
+        NETWORK = 0x00000012,
+        NETWORK_BROWSER = 0x00000013,
+        NETWORK_FILE_SYSTEM = 0x00000014,
+        NULL = 0x00000015,
+        PARALLEL_PORT = 0x00000016,
+        PHYSICAL_NETCARD = 0x00000017,
+        PRINTER = 0x00000018,
+        SCANNER = 0x00000019,
+        SERIAL_MOUSE_PORT = 0x0000001a,
+        SERIAL_PORT = 0x0000001b,
+        SCREEN = 0x0000001c,
+        SOUND = 0x0000001d,
+        STREAMS = 0x0000001e,
+        TAPE = 0x0000001f,
+        TAPE_FILE_SYSTEM = 0x00000020,
+        TRANSPORT = 0x00000021,
+        UNKNOWN = 0x00000022,
+        VIDEO = 0x00000023,
+        VIRTUAL_DISK = 0x00000024,
+        WAVE_IN = 0x00000025,
+        WAVE_OUT = 0x00000026,
+        @"8042_PORT" = 0x00000027,
+        NETWORK_REDIRECTOR = 0x00000028,
+        BATTERY = 0x00000029,
+        BUS_EXTENDER = 0x0000002a,
+        MODEM = 0x0000002b,
+        VDM = 0x0000002c,
+        MASS_STORAGE = 0x0000002d,
+        SMB = 0x0000002e,
+        KS = 0x0000002f,
+        CHANGER = 0x00000030,
+        SMARTCARD = 0x00000031,
+        ACPI = 0x00000032,
+        DVD = 0x00000033,
+        FULLSCREEN_VIDEO = 0x00000034,
+        DFS_FILE_SYSTEM = 0x00000035,
+        DFS_VOLUME = 0x00000036,
+        SERENUM = 0x00000037,
+        TERMSRV = 0x00000038,
+        KSEC = 0x00000039,
+        FIPS = 0x0000003A,
+        INFINIBAND = 0x0000003B,
+        VMBUS = 0x0000003E,
+        CRYPT_PROVIDER = 0x0000003F,
+        WPD = 0x00000040,
+        BLUETOOTH = 0x00000041,
+        MT_COMPOSITE = 0x00000042,
+        MT_TRANSPORT = 0x00000043,
+        BIOMETRIC = 0x00000044,
+        PMI = 0x00000045,
+        EHSTOR = 0x00000046,
+        DEVAPI = 0x00000047,
+        GPIO = 0x00000048,
+        USBEX = 0x00000049,
+        CONSOLE = 0x00000050,
+        NFP = 0x00000051,
+        SYSENV = 0x00000052,
+        VIRTUAL_BLOCK = 0x00000053,
+        POINT_OF_SERVICE = 0x00000054,
+        STORAGE_REPLICATION = 0x00000055,
+        TRUST_ENV = 0x00000056,
+        UCM = 0x00000057,
+        UCMTCPCI = 0x00000058,
+        PERSISTENT_MEMORY = 0x00000059,
+        NVDIMM = 0x0000005a,
+        HOLOGRAPHIC = 0x0000005b,
+        SDFXHCI = 0x0000005c,
+        UCMUCSI = 0x0000005d,
+        PRM = 0x0000005e,
+        EVENT_COLLECTOR = 0x0000005f,
+        USB4 = 0x00000060,
+        SOUNDWIRE = 0x00000061,
+
+        MOUNTMGRCONTROLTYPE = 'm',
+
+        _,
+    };
+};
+pub const IOCTL = struct {
+    pub const MOUNTMGR = struct {
+        pub const QUERY_POINTS: CTL_CODE = .{ .DeviceType = .MOUNTMGRCONTROLTYPE, .Function = 2, .Method = .BUFFERED, .Access = .ANY };
+        pub const QUERY_DOS_VOLUME_PATH: CTL_CODE = .{ .DeviceType = .MOUNTMGRCONTROLTYPE, .Function = 12, .Method = .BUFFERED, .Access = .ANY };
+    };
+};
+pub const FSCTL = struct {
+    pub const SET_REPARSE_POINT: CTL_CODE = .{ .DeviceType = .FILE_SYSTEM, .Function = 41, .Method = .BUFFERED, .Access = .SPECIAL };
+    pub const GET_REPARSE_POINT: CTL_CODE = .{ .DeviceType = .FILE_SYSTEM, .Function = 42, .Method = .BUFFERED, .Access = .ANY };
+    pub const PIPE = struct {
+        pub const ASSIGN_EVENT: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 0, .Method = .BUFFERED, .Access = .ANY };
+        pub const DISCONNECT: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 1, .Method = .BUFFERED, .Access = .ANY };
+        pub const LISTEN: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 2, .Method = .BUFFERED, .Access = .ANY };
+        pub const PEEK: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 3, .Method = .BUFFERED, .Access = .{ .READ = true } };
+        pub const QUERY_EVENT: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 4, .Method = .BUFFERED, .Access = .ANY };
+        pub const TRANSCEIVE: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 5, .Method = .NEITHER, .Access = .{ .READ = true, .WRITE = true } };
+        pub const WAIT: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 6, .Method = .BUFFERED, .Access = .ANY };
+        pub const IMPERSONATE: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 7, .Method = .BUFFERED, .Access = .ANY };
+        pub const SET_CLIENT_PROCESS: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 8, .Method = .BUFFERED, .Access = .ANY };
+        pub const QUERY_CLIENT_PROCESS: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 9, .Method = .BUFFERED, .Access = .ANY };
+        pub const GET_PIPE_ATTRIBUTE: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 10, .Method = .BUFFERED, .Access = .ANY };
+        pub const SET_PIPE_ATTRIBUTE: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 11, .Method = .BUFFERED, .Access = .ANY };
+        pub const GET_CONNECTION_ATTRIBUTE: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 12, .Method = .BUFFERED, .Access = .ANY };
+        pub const SET_CONNECTION_ATTRIBUTE: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 13, .Method = .BUFFERED, .Access = .ANY };
+        pub const GET_HANDLE_ATTRIBUTE: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 14, .Method = .BUFFERED, .Access = .ANY };
+        pub const SET_HANDLE_ATTRIBUTE: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 15, .Method = .BUFFERED, .Access = .ANY };
+        pub const FLUSH: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 16, .Method = .BUFFERED, .Access = .{ .WRITE = true } };
+
+        pub const INTERNAL_READ: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 2045, .Method = .BUFFERED, .Access = .{ .READ = true } };
+        pub const INTERNAL_WRITE: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 2046, .Method = .BUFFERED, .Access = .{ .WRITE = true } };
+        pub const INTERNAL_TRANSCEIVE: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 2047, .Method = .NEITHER, .Access = .{ .READ = true, .WRITE = true } };
+        pub const INTERNAL_READ_OVFLOW: CTL_CODE = .{ .DeviceType = .NAMED_PIPE, .Function = 2048, .Method = .BUFFERED, .Access = .{ .READ = true } };
+    };
 };
 
-pub const FILE_ANY_ACCESS = 0;
-pub const FILE_READ_ACCESS = 1;
-pub const FILE_WRITE_ACCESS = 2;
-
-/// https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/defining-i-o-control-codes
-pub fn CTL_CODE(deviceType: u16, function: u12, method: TransferType, access: u2) DWORD {
-    return (@as(DWORD, deviceType) << 16) |
-        (@as(DWORD, access) << 14) |
-        (@as(DWORD, function) << 2) |
-        @intFromEnum(method);
-}
+pub const DEVICE_TYPE = packed struct(ULONG) {
+    FileDevice: CTL_CODE.FILE_DEVICE,
+    unused: u16 = 0,
+};
 
 pub const INVALID_HANDLE_VALUE = @as(HANDLE, @ptrFromInt(maxInt(usize)));
 
@@ -4405,14 +4494,14 @@ pub const EXCEPTION_DISPOSITION = i32;
 pub const EXCEPTION_ROUTINE = *const fn (
     ExceptionRecord: ?*EXCEPTION_RECORD,
     EstablisherFrame: PVOID,
-    ContextRecord: *(Self.CONTEXT),
+    ContextRecord: *(CONTEXT),
     DispatcherContext: PVOID,
 ) callconv(.winapi) EXCEPTION_DISPOSITION;
 
 pub const UNWIND_HISTORY_TABLE_SIZE = 12;
 pub const UNWIND_HISTORY_TABLE_ENTRY = extern struct {
     ImageBase: ULONG64,
-    FunctionEntry: *Self.RUNTIME_FUNCTION,
+    FunctionEntry: *RUNTIME_FUNCTION,
 };
 
 pub const UNWIND_HISTORY_TABLE = extern struct {
@@ -4844,7 +4933,7 @@ pub fn FileInformationIterator(comptime FileInformationType: type) type {
     };
 }
 
-pub const IO_APC_ROUTINE = *const fn (PVOID, *IO_STATUS_BLOCK, ULONG) callconv(.winapi) void;
+pub const IO_APC_ROUTINE = *const fn (?*anyopaque, *IO_STATUS_BLOCK, ULONG) callconv(.winapi) void;
 
 pub const CURDIR = extern struct {
     DosPath: UNICODE_STRING,
@@ -4989,16 +5078,12 @@ pub const MOUNT_POINT_REPARSE_BUFFER = extern struct {
     PathBuffer: [1]WCHAR,
 };
 pub const MAXIMUM_REPARSE_DATA_BUFFER_SIZE: ULONG = 16 * 1024;
-pub const FSCTL_SET_REPARSE_POINT: DWORD = 0x900a4;
-pub const FSCTL_GET_REPARSE_POINT: DWORD = 0x900a8;
 pub const IO_REPARSE_TAG_SYMLINK: ULONG = 0xa000000c;
 pub const IO_REPARSE_TAG_MOUNT_POINT: ULONG = 0xa0000003;
 pub const SYMLINK_FLAG_RELATIVE: ULONG = 0x1;
 
 pub const SYMBOLIC_LINK_FLAG_DIRECTORY: DWORD = 0x1;
 pub const SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE: DWORD = 0x2;
-
-pub const MOUNTMGRCONTROLTYPE = 0x0000006D;
 
 pub const MOUNTMGR_MOUNT_POINT = extern struct {
     SymbolicLinkNameOffset: ULONG,
@@ -5016,7 +5101,6 @@ pub const MOUNTMGR_MOUNT_POINTS = extern struct {
     NumberOfMountPoints: ULONG,
     MountPoints: [1]MOUNTMGR_MOUNT_POINT,
 };
-pub const IOCTL_MOUNTMGR_QUERY_POINTS = CTL_CODE(MOUNTMGRCONTROLTYPE, 2, .METHOD_BUFFERED, FILE_ANY_ACCESS);
 
 pub const MOUNTMGR_TARGET_NAME = extern struct {
     DeviceNameLength: USHORT,
@@ -5026,7 +5110,6 @@ pub const MOUNTMGR_VOLUME_PATHS = extern struct {
     MultiSzLength: ULONG,
     MultiSz: [1]WCHAR,
 };
-pub const IOCTL_MOUNTMGR_QUERY_DOS_VOLUME_PATH = CTL_CODE(MOUNTMGRCONTROLTYPE, 12, .METHOD_BUFFERED, FILE_ANY_ACCESS);
 
 pub const OBJECT_INFORMATION_CLASS = enum(c_int) {
     ObjectBasicInformation = 0,
